@@ -1,0 +1,31 @@
+[project]
+name = "mnemerynne-balancer"
+version = "0.1.0"
+description = "Web control panel for llama.cpp on two ROCm cards, with an OpenAI-compatible balancer in front"
+requires-python = ">=3.12"
+# Exact pins, the same versions Mnemerynne runs: upgrade deliberately and re-run the tests.
+dependencies = [
+    "fastapi==0.156.1",
+    "uvicorn==0.54.0",
+    "httpx==0.28.1",
+]
+
+[dependency-groups]
+dev = ["pytest==9.1.0"]
+
+[project.scripts]
+mnemerynne-balancer = "mnemerynne_balancer.cli:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["mnemerynne_balancer"]
+
+[tool.setuptools.package-data]
+mnemerynne_balancer = ["page.html", "catalog.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

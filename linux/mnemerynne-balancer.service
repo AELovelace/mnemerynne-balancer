@@ -1,0 +1,34 @@
+# mnemerynne-balancer on 9180: the control page and the /v1 balancer. It owns its llama-servers (one per card,
+# 127.0.0.1:9181/9182): they live in this unit's cgroup and stop with it.
+[Unit]
+Description=mnemerynne-balancer (llama.cpp control page and /v1 balancer, port 9180)
+After=network-online.target npc-rag.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=balancer
+Group=balancer
+# render/video: the cards (llama-server) and their sysfs readings.
+SupplementaryGroups=render video
+WorkingDirectory=/opt/mnemerynne-balancer
+Environment=PYTHONUNBUFFERED=1
+# ROCm keeps small caches under $HOME; the code directory is read-only here.
+Environment=HOME=/var/lib/mnemerynne-balancer
+ExecStart=/opt/mnemerynne-balancer/.venv/bin/python -m mnemerynne_balancer serve
+Restart=on-failure
+RestartSec=5
+# Stopping the unit stops every llama-server it started.
+KillMode=control-group
+TimeoutStopSec=30
+LimitMEMLOCK=infinity
+StateDirectory=mnemerynne-balancer
+StateDirectoryMode=0750
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/mnemerynne-balancer
+
+[Install]
+WantedBy=multi-user.target

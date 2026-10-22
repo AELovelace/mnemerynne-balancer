@@ -24,9 +24,54 @@ It follows **npc-rag**'s patterns, which already solve most of this:
 This project is narrower: it only manages llama.cpp, and it owns the
 llama-server processes itself.
 
+## Target: the npc-rag box
+
+It runs on the npc-rag node: Ubuntu 26.04, two RX 6800-class cards (gfx1030),
+ROCm from Ubuntu's archive.
+
+**Reuse:** llama.cpp is already built there. `npc-rag/linux/build-llama.sh`
+put a HIP build in `/opt/llama.cpp/hip/bin` (tag b9481). The balancer uses
+that binary (`LLAMA_SERVER=/opt/llama.cpp/hip/bin/llama-server`) instead of
+building its own, so the two projects stay on the same llama.cpp. A
+`--llama-server` override is still there for trying a newer tag.
+
+**Share the cards with npc-rag.** npc-rag's student fleet already runs
+llama-server copies on both cards (`STUDENT_COPIES_PER_DEVICE=2`, ports
+9100+). The balancer never touches those processes. It hosts *its* models in
+the VRAM they leave free:
+
+- The VRAM check uses the card's real free memory from `rocm-smi`, which
+  includes npc-rag's copies, not only what the balancer itself started.
+- Each card tile shows npc-rag's copies too, read-only, so it's clear who
+  holds what.
+- **Order at boot:** the unit starts `After=npc-rag.service`, so the student
+  fleet takes its VRAM first. The balancer then fits around it instead of
+  starving the game NPC.
+- **Later, optionally:** npc-rag could stop running its own copies
+  (`STUDENT_FLEET=off`) and point `LLM_URL` at the balancer. Then one panel
+  manages every model on the box. That is a deliberate step, not part of
+  this build.
+
+**Ports.** These avoid npc-rag's 9090–9093 and its copies counting up from
+9100:
+
+| Port | What | Reachable from |
+|---|---|---|
+| 9180 | balancer: control page and `/v1` API | the LAN (ufw) |
+| 9181, 9182 | the balancer's llama-server on card 0 and card 1 | this machine only |
+
+**Mnemerynne** reaches it over the LAN. The Mnemerynne box's
+`MNEMERYNNE_LLM_URL` becomes `http://<npc-rag box>:9180/v1`, with the
+balancer's API key. Erynne's generator moves from the RX 580 (Vulkan) to the
+6800s (HIP), which is the turbocharge. The RX 580 unit stays installed as a
+fallback: if the balancer is unreachable, switching back is a one-line
+change.
+
 ## What it is not
 
-- Not multi-host. One box, two cards. A second box would run its own copy.
+- Not a cluster manager. Each box runs its own balancer for its own two
+  cards; balancers never talk to each other. Spreading requests across
+  boxes is Mnemerynne's job (see "Several nodes").
 - Not a model zoo. A curated catalog plus "add a GGUF from a Hugging Face
   repo"; no arbitrary URLs.
 - Not exposed to the internet. Plain HTTP on the LAN, as npc-rag's control page
@@ -102,16 +147,18 @@ catalog entries with default launch settings that you can edit.
   `--device ROCmN`, as npc-rag does, so no `HIP_VISIBLE_DEVICES`.
   `rocm-smi --showtemp --showuse --showmemuse --showpower --json` feeds the
   tiles.
-- **One instance per card.** Its settings are stored in `data/state.json`, so
-  the same models come back after a reboot. The settings are:
+- **One balancer instance per card**, next to npc-rag's copies. Its settings
+  are stored in `data/state.json`, so the same models come back after a
+  reboot. The settings are:
   - the model
   - context
   - parallel slots
   - extra args
-  - port (fixed per card, e.g. 127.0.0.1:9200 and :9201)
+  - port (fixed per card: 127.0.0.1:9181 and :9182)
 - **Before launching, the VRAM fit is checked**: the file size plus a KV-cache
-  estimate from context × slots must fit the card's free VRAM. If it doesn't,
-  the panel says so and asks you to confirm instead of letting the card fail.
+  estimate from context × slots must fit the card's *currently free* VRAM,
+  minus a 512 MB margin. If it doesn't, the panel says so and asks you to
+  confirm instead of letting the card fail.
 - **Launch:** `-m … --host 127.0.0.1 --port … -c … -np … -ngl 999 --device
   ROCmN` plus the entry's flags. The panel polls `/health` until it returns
   200, showing "loading" while llama-server answers 503.
@@ -127,8 +174,9 @@ catalog entries with default launch settings that you can edit.
 
 ## The balancer (proxy.py)
 
-- A single address, `0.0.0.0:9190/v1/...` (LAN), with an optional bearer
-  key (`BALANCER_API_KEY`).
+- A single address, `0.0.0.0:9180/v1/...` (LAN), with a bearer key
+  (`BALANCER_API_KEY`). The key is required, since Mnemerynne calls it from
+  another box.
 - `/v1/models` lists the models that are running.
 - A request's `model` field picks the instances serving that model:
   - one instance: the request goes there;
@@ -143,9 +191,49 @@ catalog entries with default launch settings that you can edit.
 - The page shows per-card counters: requests, in flight, last error, and
   tokens/s from llama-server's `/metrics` (`--metrics`).
 
-**Mnemerynne** then sets `MNEMERYNNE_LLM_URL` (and, if the embedder moves
-here, its embed URL) to the balancer. For example, Erynne could get both
-cards when both run LFM2.5.
+**Mnemerynne** then sets `MNEMERYNNE_LLM_URL` to the balancer. For example,
+Erynne could get both cards when both run LFM2.5. The embedder stays on the
+Mnemerynne box next to the files it indexes. Only the generator moves.
+
+## Several nodes (balanced by Mnemerynne)
+
+Balancers don't know about each other. Each one serves only its own cards.
+**Mnemerynne** holds the list and does the balancing between nodes.
+
+**What each balancer provides:** `GET /v1/balancer/load` (API key required)
+returns, for each model it's running:
+- requests in flight
+- total parallel slots
+- whether it's ready
+
+The figures are this node's own: its two cards, nothing else.
+
+**What Mnemerynne does** (a change in the Mnemerynne repo):
+
+- **Settings → Balancer nodes:** a comma-separated list, for example
+  `http://10.0.5.20:9180, http://10.0.5.21:9180`, plus one API key used for
+  all of them. It's saved in Mnemerynne's settings and applied without a
+  restart.
+- **Least busy node.** Every node is polled every 2 s in the background
+  (1 s timeout), so a request never waits on a poll. Each answer goes to
+  the ready node with the lowest in-flight ÷ slots for Erynne's model. When
+  Mnemerynne sends a request, it adds one to that node's count straight
+  away, so a burst spreads out instead of piling onto the node that looked
+  idle 2 s ago. Ties go to the earlier node in the list.
+- **Failover.** A node that refuses the connection, times out, rejects the
+  key or answers 5xx sits out for 30 s. A request that fails *before any
+  output* is retried once on the next-best node. Once Erynne has started
+  streaming an answer, it isn't retried.
+- **Fallback.** With the list empty, or every node down, Mnemerynne uses
+  `MNEMERYNNE_LLM_URL` (the RX 580) as today, and the Settings page says
+  so.
+- **The Settings page** shows one row per node: reachable or not, the model
+  running, in flight / slots, and answers sent there in the last hour.
+- **Checked on save.** Each URL must be http(s), and its
+  `/v1/balancer/load` must answer with the key before the list is accepted.
+
+The embedder stays on the Mnemerynne box. Only the generator goes to the
+nodes.
 
 ## Control page
 
@@ -176,20 +264,25 @@ The proxy's `/v1` routes use the API key, not the cookie.
 
 ## Deploy (linux/)
 
-- `build-llama.sh` builds llama.cpp with `-DGGML_HIP=ON`,
-  `-DAMDGPU_TARGETS=<from rocminfo>` and a pinned `LLAMA_TAG` into
-  `/opt/llama.cpp-rocm/bin`. It's safe to re-run, and a `--tag` flag upgrades.
-- `install.sh`, run as root, does the following:
+- **No build script.** It uses npc-rag's `/opt/llama.cpp/hip` build. If
+  that's missing, `install.sh` says to run `npc-rag/linux/build-llama.sh`.
+- `install.sh`, run as root on Ubuntu 26.04 and safe to re-run, does the
+  following:
   - creates the `balancer` user (nologin; groups render, video)
-  - installs the code in `/opt/mnemerynne-balancer` with `uv sync --frozen`
+  - installs the code in `/opt/mnemerynne-balancer` with `uv sync --frozen`,
+    using the `/opt/uv` npc-rag already installed or installing it the same
+    way
   - creates `/var/lib/mnemerynne-balancer/{models,logs,data}`
-  - seeds `.env` with the password
+  - seeds `.env` with a generated password and API key, both printed once
   - installs and enables the unit
-  - opens the ports with firewalld or ufw, LAN-only if a zone is given
-  - prints the URL and password
+  - allows 9180 in ufw
 - The unit runs `User=balancer`, `SupplementaryGroups=render video`,
-  `KillMode=control-group`, `LimitMEMLOCK=infinity`, `ProtectSystem=strict`
-  with the state directory writable, and `Restart=on-failure`.
+  `After=npc-rag.service`, `KillMode=control-group`, `LimitMEMLOCK=infinity`,
+  `ProtectSystem=strict` with the state directory writable, and
+  `Restart=on-failure`.
+- **Models live on the balancer's own disk**
+  (`/var/lib/mnemerynne-balancer/models`). The install script checks there's
+  room: LFM2.5 Q8 is about 2.7 GB, and Qwen3-8B Q4 about 5 GB.
 
 ## Tests
 
@@ -201,38 +294,47 @@ pytest with injectable fakes, as `test_student_fleet.py` does:
 - `--list-devices` and `rocm-smi` output parsing from captured real samples
 - the proxy: model routing, least-in-flight choice, retry on the other card,
   SSE pass-through, 503s
+- `/v1/balancer/load`: correct counts while requests are in flight,
+  requires the key
+- in the Mnemerynne repo: least-busy choice across fake nodes, local count
+  bumps during a burst, a dead node sitting out, retry before the first byte
+  only, falling back to `MNEMERYNNE_LLM_URL`, URL list validation
 - auth: login rate limit, CSRF, secrets never echoed
 - state restored after a restart
 
 ## Build order
 
-1. **Skeleton:** pyproject and uv, config, cli `devices` (list cards), and
-   `build-llama.sh`. Check: both cards appear as ROCm0/ROCm1.
+1. **Skeleton:** pyproject and uv, config, and cli `devices` (list cards with
+   free VRAM from `rocm-smi`). Check on the npc-rag box: ROCm0/ROCm1 appear
+   with npc-rag's copies counted as used.
 2. **Downloads:** catalog, HF resolve, resumable verified download, and the
    CLI `download`.
 3. **Instances:** start, stop and watch one model per card, saved in state,
    restored at boot.
 4. **Page and auth:** status tiles, models, logs, settings, audit.
 5. **Balancer:** `/v1` proxy with routing, retry and counters.
-6. **Deploy:** install script and unit, README (reference-style, not a
-   changelog). Then point Mnemerynne at it.
+6. **Load endpoint:** `/v1/balancer/load`.
+7. **Deploy:** install script and unit, README (reference-style, not a
+   changelog).
+8. **Point Mnemerynne at it.** In the Mnemerynne repo, add the Balancer
+   nodes setting with least-busy balancing and failover. On the box, enter
+   the node URLs and the key. Compare Erynne's speed against the RX 580
+   with the same questions, and keep the RX 580 unit as a fallback.
 
 ## Open questions
 
-- **Which box and which cards?**
-  - The Mnemerynne box's RX 580 is gfx803. Current ROCm doesn't support it
-    (that was the old-HIP experiment), so it would stay on Vulkan.
-  - If the two ROCm cards are in another machine (like the npc-rag nodes,
-    gfx1030), build for their targets.
-  - If one card can't run ROCm, the plan could allow a Vulkan build per card.
-    It's a small addition, since npc-rag already falls back from HIP to
-    Vulkan.
-- **The name.** You said both "mnemerynne-lbalancer" and
-  "mnemerynne-balancer"; the folder is `mnemerynne-balancer`. Rename before
-  the first push if you meant the other.
-- **Embeddings.** Should the embedder move here too, or stay on the 1050 Ti
-  next to Mnemerynne?
+- **"Busy" isn't a usable load signal.** Both cards report 99% busy at
+  34–40 W, which is idle power. That's a sysfs reading artifact, so the
+  card tiles show power and temperature and label busy as "reported". Load
+  for balancing always comes from request counts, never from GPU busy.
 - **Several models per card.** Should a card ever host two small models at
-  once, such as LFM2.5 plus the embedder? The plan says one per card to keep
-  VRAM accounting simple; two would need the fit check per card, not per
-  instance.
+  once? The plan says one per card to keep VRAM accounting simple; two would
+  need the fit check per card, not per instance.
+
+Settled: VRAM. With npc-rag's copies running, each card uses 7.9 of 16 GB
+(measured 2026-10-22), leaving about 8 GB free per card, or about 7.5 GB
+after the 512 MB margin. Per card, that fits LFM2.5 Q8 (about 2.7 GB plus
+roughly 1–2 GB of KV for 4 slots × 8k) with room to spare, or Qwen3-8B
+Q4_K_M (about 5 GB plus about 1.2 GB of KV at 8k context) more tightly.
+npc-rag keeps two copies per card. The repo is `mnemerynne-balancer`. The embedder stays on the
+Mnemerynne box. The node list and balancing between nodes live only in Mnemerynne.
