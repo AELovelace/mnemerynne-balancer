@@ -84,5 +84,14 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         print(error, file=sys.stderr)
         return 2
-    uvicorn.run(app, host=s.host, port=s.port, log_level="info", proxy_headers=False)
+    class Server(uvicorn.Server):
+        def handle_exit(self, sig, frame):
+            # Before connections drain, not after: the watchdog must not take systemd's SIGTERM to the
+            # llama-servers for a crash and start new ones while we stop.
+            app.state.fleet.closing = True
+            super().handle_exit(sig, frame)
+
+    # Streams get 10 s to finish, then the cards up to STOP_GRACE (in parallel): inside TimeoutStopSec=30.
+    Server(uvicorn.Config(app, host=s.host, port=s.port, log_level="info", proxy_headers=False,
+                          timeout_graceful_shutdown=10)).run()
     return 0

@@ -104,6 +104,9 @@ class Fleet:
         self.locks = [asyncio.Lock() for _ in self.cards]
         self._task: asyncio.Task | None = None
         self._last_metrics = 0.0
+        # Set when shutdown begins (SIGTERM): systemd stops the llama-servers at the same moment, so their exits
+        # are not crashes, and nothing may start while connections drain.
+        self.closing = False
 
     # ------------------------------------------------------------ state file
     def load_state(self) -> None:
@@ -239,6 +242,8 @@ class Fleet:
             raise ValueError("Context must be 256–262144 per slot and slots 1–64.")
         check_args(args)
         async with self.locks[index]:
+            if self.closing:
+                raise ValueError("The balancer is shutting down.")
             if card.process is not None:
                 card.state = "stopping"
                 await self._kill(card)
@@ -261,9 +266,15 @@ class Fleet:
         return card
 
     async def stop_all(self) -> None:
-        for card in self.cards:
+        """Shutdown: stop every llama-server, all at once so two slow cards still fit in systemd's TimeoutStopSec.
+        config.running is kept, so the next boot brings them back."""
+        self.closing = True
+
+        async def one(card: Card) -> None:
             async with self.locks[card.index]:
                 await self._kill(card)
+                card.state = "stopped"
+        await asyncio.gather(*(one(c) for c in self.cards))
 
     def log_tail(self, index: int, lines: int = 200) -> str:
         path = self.log_path(self.card(index))
@@ -279,6 +290,8 @@ class Fleet:
     # ------------------------------------------------------------ watchdog
     async def tick(self) -> None:
         """One pass: notice exits, promote loading cards that answer /health, restart crashed ones after backoff."""
+        if self.closing:
+            return
         now = self.clock()
         for card in self.cards:
             if self.locks[card.index].locked():

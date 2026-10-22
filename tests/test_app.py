@@ -186,3 +186,18 @@ def test_no_password_no_app(settings):
     from dataclasses import replace
     with pytest.raises(ValueError):
         create_app(replace(settings, admin_password="short"), devices=DEVICES)
+
+
+def test_restart_brings_the_cards_back(make, settings):
+    app = make()
+    c = signed_in(app)
+    for index in (0, 1):
+        assert c.post(f"/api/cards/{index}/start", json={"model": "lfm2.5-2.6b-q8"}, headers=HDR).status_code == 200
+    procs = app.state.fleet.popen.procs
+    c.__exit__(None, None, None)         # Shutdown, as on SIGTERM.
+    assert [p.returncode for p in procs] == [-15, -15]
+    again = make()
+    with TestClient(again):
+        cards = again.state.fleet.cards
+        assert [(c.config.model, c.config.running) for c in cards] == [("lfm2.5-2.6b-q8", True)] * 2
+        assert all(c.next_start is not None for c in cards)   # The watchdog starts them on its first pass.

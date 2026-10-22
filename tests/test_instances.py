@@ -134,3 +134,44 @@ def test_vram_fit_counts_other_processes_and_frees_our_own(settings):
                                                   "fits": True, "known": False}
         await f.http.aclose()
     asyncio.run(go())
+
+
+def test_shutdown_stops_every_card_and_the_next_boot_brings_them_back(settings):
+    async def go():
+        f, popen = fleet(settings)
+        await f.start(0, "lfm2.5-2.6b-q8", 8192, 4, "")
+        await f.start(1, "lfm2.5-2.6b-q8", 4096, 2, "-fa off")
+        await f.stop_all()
+        assert [p.returncode for p in popen.procs] == [-15, -15]
+        assert [c.state for c in f.cards] == ["stopped", "stopped"] and f.closing
+        assert json.loads(settings.pid_file.read_text()) == {}
+        saved = json.loads(settings.state_file.read_text())["cards"]
+        assert [c["running"] for c in saved] == [True, True]   # Wanted running: a restart isn't a stop.
+        await f.http.aclose()
+        g, popen2 = fleet(settings)
+        g.load_state()
+        await g.tick()
+        assert [c.state for c in g.cards] == ["loading", "loading"]
+        assert [p.cmd[p.cmd.index("--device") + 1] for p in popen2.procs] == ["ROCm0", "ROCm1"]
+        assert popen2.procs[1].cmd[-2:] == ["-fa", "off"] and g.cards[1].config.ctx == 4096
+        await g.http.aclose()
+    asyncio.run(go())
+
+
+def test_no_restarts_once_shutdown_begins(settings):
+    async def go():
+        clock = Clock()
+        f, popen = fleet(settings, clock=clock)
+        await f.start(0, "lfm2.5-2.6b-q8", 8192, 4, "")
+        f.closing = True                 # SIGTERM arrived; systemd stops the llama-servers too.
+        popen.procs[0].terminate()
+        for _ in range(3):
+            clock.t += 120
+            await f.tick()
+        assert len(popen.procs) == 1 and not f.cards[0].failures and f.cards[0].config.running
+        with pytest.raises(ValueError, match="shutting down"):
+            await f.start(1, "lfm2.5-2.6b-q8", 8192, 4, "")
+        await f.stop_all()
+        assert len(popen.procs) == 1
+        await f.http.aclose()
+    asyncio.run(go())
