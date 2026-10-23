@@ -175,3 +175,34 @@ def test_no_restarts_once_shutdown_begins(settings):
         assert len(popen.procs) == 1
         await f.http.aclose()
     asyncio.run(go())
+
+
+@pytest.mark.skipif(not instances.WINDOWS, reason="Windows job objects")
+def test_windows_llama_servers_die_with_the_balancer(tmp_path):
+    import subprocess
+    import sys
+    import time
+    # A stand-in balancer: starts a long-running child the way _spawn does, then dies without cleaning up.
+    script = tmp_path / "balancer.py"
+    script.write_text(
+        "import os, subprocess, sys\n"
+        "from mnemerynne_balancer import instances\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], stdin=subprocess.DEVNULL,\n"
+        "                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "instances._join_job(child)\n"
+        "print(child.pid, flush=True)\n"
+        "os._exit(1)\n")
+    # The base interpreter, not the venv's python.exe: that launcher keeps its children in a kill-on-close job of
+    # its own, which would pass this test without ours.
+    import site
+    root = instances.Path(instances.__file__).parents[1]
+    env = {**instances.os.environ, "PYTHONPATH": instances.os.pathsep.join([str(root), *site.getsitepackages()])}
+    out = subprocess.run([sys._base_executable, str(script)], capture_output=True, text=True, timeout=30, env=env)
+    pid = int(out.stdout.split()[0])
+    for _ in range(50):
+        alive = str(pid) in subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                                          capture_output=True, text=True).stdout
+        if not alive:
+            break
+        time.sleep(0.1)
+    assert not alive, out.stderr

@@ -18,10 +18,12 @@ from pathlib import Path
 import httpx
 
 from mnemerynne_balancer.config import Settings
+from mnemerynne_balancer.devices import child_env
 from mnemerynne_balancer.models import Models, estimate_mib
 
 LOG = logging.getLogger("balancer.instances")
 LINUX = os.name == "posix" and Path("/proc").is_dir()
+WINDOWS = os.name == "nt"
 BACKOFF_START, BACKOFF_MAX = 5.0, 60.0
 GIVE_UP_FAILURES, GIVE_UP_WINDOW = 5, 600.0
 STOP_GRACE = 15.0
@@ -87,6 +89,54 @@ class Card:
 def _die_with_parent():  # Linux: llama-server gets SIGTERM if the balancer dies, even outside systemd.
     import ctypes
     ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, 15)  # PR_SET_PDEATHSIG = 1, SIGTERM = 15
+
+
+_job = None
+
+
+def _windows_job():
+    """Windows' PDEATHSIG: a job object with KILL_ON_JOB_CLOSE. Its handle closes when the balancer exits, however it
+    exits, and Windows then ends every llama-server in it, so a crash never leaves one holding VRAM."""
+    global _job
+    if _job is None:
+        import ctypes
+        from ctypes import wintypes
+
+        class Basic(ctypes.Structure):  # JOBOBJECT_BASIC_LIMIT_INFORMATION
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class Extended(ctypes.Structure):  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+            _fields_ = [("Basic", Basic), ("Io", ctypes.c_uint64 * 6), ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        job = k32.CreateJobObjectW(None, None)
+        info = Extended()
+        info.Basic.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not job or not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):  # 9: extended
+            raise OSError(ctypes.get_last_error(), "couldn't set up the job object")
+        _job = (k32, job)
+    return _job
+
+
+def _join_job(proc) -> None:
+    handle = getattr(proc, "_handle", None)  # Popen's process handle (tests' stand-ins have none).
+    if WINDOWS and handle is not None:
+        try:
+            k32, job = _windows_job()
+            if not k32.AssignProcessToJobObject(job, int(handle)):
+                raise OSError("AssignProcessToJobObject failed")
+        except OSError as error:
+            LOG.warning("llama-server %s won't stop if the balancer crashes: %s", proc.pid, error)
 
 
 class Fleet:
@@ -156,7 +206,9 @@ class Fleet:
             out.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} {shlex.join(cmd)}\n".encode())
             out.flush()
             kwargs = {"preexec_fn": _die_with_parent} if LINUX else {}
-            card.process = self.popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **kwargs)
+            card.process = self.popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                      env=child_env(), **kwargs)
+        _join_job(card.process)
         card.state, card.error, card.started_at, card.next_start = "loading", "", time.time(), None
         card.tokens_per_s = None
         self._write_pids()

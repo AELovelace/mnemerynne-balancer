@@ -43,7 +43,7 @@ def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, re
         devices, raw = dev.probe_devices(s.llama_server)
         if not devices:
             LOG.warning("llama-server listed no GPUs:\n%s", raw)
-    read_cards = readings or dev.gpu_readings
+    read_cards = readings or dev.card_readings
     secret_store = Secrets(s)
     models = Models(s.models_dir, s.custom_models_file)
     fleet = Fleet(s, models, devices, **({"popen": popen} if popen else {}), transport=instance_transport)

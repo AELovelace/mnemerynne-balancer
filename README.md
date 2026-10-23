@@ -47,6 +47,36 @@ sudo -u balancer /opt/mnemerynne-balancer/.venv/bin/python -m mnemerynne_balance
 # ROCm0    AMD Radeon RX 6800 XT (16368 MiB)  used 8100 / 16384 MiB, free 8284 MiB, 28 °C  -> card port 9181
 ```
 
+## Windows with NVIDIA cards
+
+The same code runs on Windows. VRAM and temperature come from `nvidia-smi`
+instead of sysfs, and the llama-servers sit in a job object that Windows
+closes when the balancer exits, so a crash never leaves one holding VRAM.
+
+1. **llama.cpp:** download a `win-cuda-12.x-x64` release from
+   github.com/ggml-org/llama.cpp/releases, plus the matching `cudart-…`
+   zip, and unzip both into `C:\llama.cpp`. Maxwell cards (GTX Titan X,
+   9xx) need CUDA **12** builds and driver 580 or older: CUDA 13 dropped
+   them. The first start compiles kernels for the card and takes a minute.
+2. **Balancer:**
+   ```powershell
+   git clone https://github.com/AELovelace/mnemerynne-balancer.git C:\mnemerynne-balancer
+   cd C:\mnemerynne-balancer
+   py -m uv sync
+   copy .env.example .env    # then set the values below
+   ```
+   In `.env`: `LLAMA_SERVER=C:\llama.cpp\llama-server.exe`,
+   `BALANCER_DATA_DIR=C:\mnemerynne-balancer\data`, `ADMIN_PASSWORD`, `BALANCER_API_KEY`.
+3. **Check the cards:** `.venv\Scripts\python -m mnemerynne_balancer devices`
+   should list `CUDA0` and `CUDA1` with their VRAM.
+4. **Run it:** `.venv\Scripts\python -m mnemerynne_balancer serve`. To start
+   it at boot, make a scheduled task that runs that command at startup
+   ("Run whether user is logged on or not"), and open the port:
+   `New-NetFirewallRule -DisplayName "mnemerynne-balancer" -Direction Inbound -Protocol TCP -LocalPort 9180 -RemoteAddress LocalSubnet -Action Allow`.
+
+On Windows, stopping a card ends its llama-server at once, not after its
+current request; there is no SIGTERM.
+
 ## Everyday use
 
 Open `http://<node>:9180/` and sign in with the password.

@@ -58,3 +58,37 @@ def test_readings_pair_by_position_or_vram():
     with_igpu = [{"vram_total_mib": 512, "pci": "igpu"}] + readings
     assert [r["pci"] for r in dev.match_readings(devices, with_igpu)] == ["a", "b"]
     assert dev.match_readings(devices, []) == [None, None]
+
+
+SMI = """00000000:03:00.0, 12288, 8100, 97, 71, [N/A]
+00000000:02:00.0, 12288, 300, 0, 34, 15.20
+"""
+
+
+def test_nvidia_smi_readings_in_pci_order():
+    seen = []
+
+    def run(cmd, **kw):
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, SMI, "")
+    cards = dev.nvidia_readings(runner=run)
+    assert seen[0][0] == "nvidia-smi" and "--format=csv,noheader,nounits" in seen[0]
+    assert [c["pci"] for c in cards] == ["00000000:02:00.0", "00000000:03:00.0"]
+    assert cards[0] == {"pci": "00000000:02:00.0", "vram_total_mib": 12288, "vram_used_mib": 300, "vram_free_mib": 11988,
+                        "busy_pct": 0.0, "temp_c": 34.0, "power_w": 15.2}
+    assert cards[1]["vram_free_mib"] == 4188 and cards[1]["power_w"] is None   # Maxwell: no power reading.
+
+
+def test_no_nvidia_smi_means_no_readings():
+    def run(cmd, **kw):
+        raise FileNotFoundError(cmd[0])
+    assert dev.nvidia_readings(runner=run) == []
+    failed = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 9, "NVIDIA-SMI has failed", "")  # noqa: E731
+    assert dev.nvidia_readings(runner=failed) == []
+
+
+def test_llama_server_numbers_cuda_cards_in_pci_order():
+    env = []
+    run = lambda cmd, **kw: env.append(kw["env"]) or subprocess.CompletedProcess(cmd, 0, LIST, "")  # noqa: E731
+    dev.probe_devices("llama-server", runner=run)
+    assert env[0]["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"

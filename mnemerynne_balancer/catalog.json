@@ -14,12 +14,12 @@
      "kv_mib_per_1k": 24, "ctx": 8192, "slots": 4, "args": "--jinja",
      "notes": "Mixture of experts: 8B weights, about 1B active per token. KV figure is an estimate."},
     {"id": "qwen3-4b-q4", "name": "Qwen3 4B Q4_K_M", "repo": "Qwen/Qwen3-4B-GGUF", "file": "Qwen3-4B-Q4_K_M.gguf",
-     "kv_mib_per_1k": 144, "ctx": 8192, "slots": 4, "args": "--jinja",
-     "notes": "Thinks before answering unless the prompt says /no_think."},
+     "kv_mib_per_1k": 144, "ctx": 8192, "slots": 4, "args": "--jinja -fa off",
+     "notes": "Thinks before answering unless the prompt says /no_think. -fa off: flash attention crashes on the RX 6800s (GGML_ASSERT max_blocks_per_sm)."},
     {"id": "qwen3-4b-q8", "name": "Qwen3 4B Q8_0", "repo": "Qwen/Qwen3-4B-GGUF", "file": "Qwen3-4B-Q8_0.gguf",
-     "kv_mib_per_1k": 144, "ctx": 8192, "slots": 2, "args": "--jinja", "notes": ""},
+     "kv_mib_per_1k": 144, "ctx": 8192, "slots": 2, "args": "--jinja -fa off", "notes": ""},
     {"id": "qwen3-8b-q4", "name": "Qwen3 8B Q4_K_M", "repo": "Qwen/Qwen3-8B-GGUF", "file": "Qwen3-8B-Q4_K_M.gguf",
-     "kv_mib_per_1k": 144, "ctx": 4096, "slots": 2, "args": "--jinja",
+     "kv_mib_per_1k": 144, "ctx": 4096, "slots": 2, "args": "--jinja -fa off",
      "notes": "About 5 GB: fits next to npc-rag's copies with a small context."}
   ]
 }

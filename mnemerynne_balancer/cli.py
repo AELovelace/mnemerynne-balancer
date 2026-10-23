@@ -14,7 +14,7 @@ from mnemerynne_balancer.models import Models
 
 def _devices(s) -> int:
     found, raw = dev.probe_devices(s.llama_server)
-    readings = dev.gpu_readings()
+    readings = dev.card_readings()
     if not found:
         print(f"{s.llama_server} listed no GPUs. Its output:\n{raw}")
         return 1

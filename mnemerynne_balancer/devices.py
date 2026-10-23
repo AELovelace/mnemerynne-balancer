@@ -1,6 +1,8 @@
-"""The cards: names and VRAM as llama-server sees them, live readings from amdgpu's sysfs files."""
+"""The cards: names and VRAM as llama-server sees them, live readings from amdgpu's sysfs files (AMD on Linux) or
+nvidia-smi (NVIDIA, on Linux or Windows)."""
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -8,12 +10,19 @@ from pathlib import Path
 DEVICE_LINE = re.compile(r"^\s*([A-Za-z]+\d+)\s*:\s*(.+?)\s*\((\d+)\s*MiB")  # "  ROCm0: AMD Radeon RX 6800 XT (16368 MiB, ...)"
 SYSFS = Path("/sys/class/drm")
 AMD_VENDOR = "0x1002"
+NVIDIA_QUERY = "pci.bus_id,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw"
+
+
+def child_env() -> dict:
+    """Environment for llama-server: CUDA numbers cards fastest-first by default, nvidia-smi in PCI order. PCI order
+    for both, so CUDA0 is the first card in the readings. (ROCm already numbers in PCI order and ignores this.)"""
+    return {**os.environ, "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
 
 
 def probe_devices(server: str, runner=subprocess.run) -> tuple[list[dict], str]:
     """llama-server --list-devices: its GPUs (CPU entries skipped) and the raw output, which says why when there are none."""
     try:
-        out = runner([server, "--list-devices"], capture_output=True, text=True, timeout=120)
+        out = runner([server, "--list-devices"], capture_output=True, text=True, timeout=120, env=child_env())
     except (OSError, subprocess.SubprocessError) as error:
         return [], f"couldn't run {server}: {error}"
     text = f"{out.stdout}\n{out.stderr}"
@@ -76,6 +85,40 @@ def gpu_readings(root: Path = SYSFS) -> list[dict]:
                       "vram_free_mib": round(total - used), "busy_pct": _num(device / "gpu_busy_percent"),
                       **_hwmon(device)})
     return sorted(cards, key=lambda c: c["pci"])
+
+
+def _float(text: str) -> float | None:
+    try:
+        return float(text)
+    except ValueError:
+        return None  # "[N/A]": the card doesn't report it (Maxwell boards often lack power.draw).
+
+
+def nvidia_readings(runner=subprocess.run) -> list[dict]:
+    """Every NVIDIA card from nvidia-smi, in PCI order: the same readings as gpu_readings. [] without nvidia-smi."""
+    try:
+        out = runner(["nvidia-smi", f"--query-gpu={NVIDIA_QUERY}", "--format=csv,noheader,nounits"],
+                     capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    cards = []
+    for line in out.stdout.splitlines() if out.returncode == 0 else []:
+        fields = [f.strip() for f in line.split(",")]
+        if len(fields) != 6:
+            continue
+        total, used = _float(fields[1]), _float(fields[2]) or 0.0
+        if not total:
+            continue
+        power = _float(fields[5])
+        cards.append({"pci": fields[0].lower(), "vram_total_mib": round(total), "vram_used_mib": round(used),
+                      "vram_free_mib": round(total - used), "busy_pct": _float(fields[3]), "temp_c": _float(fields[4]),
+                      "power_w": round(power, 1) if power is not None else None})
+    return sorted(cards, key=lambda c: c["pci"])
+
+
+def card_readings() -> list[dict]:
+    """AMD cards from sysfs; if there are none (Windows, or an NVIDIA box), NVIDIA cards from nvidia-smi."""
+    return gpu_readings() or nvidia_readings()
 
 
 def match_readings(devices: list[dict], readings: list[dict]) -> list[dict | None]:
