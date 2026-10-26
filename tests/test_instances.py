@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -7,7 +8,7 @@ import pytest
 from conftest import DEVICES, FakePopen, install_model
 from mnemerynne_balancer import instances
 from mnemerynne_balancer.instances import Fleet, check_args
-from mnemerynne_balancer.models import Models
+from mnemerynne_balancer.models import Models, chat_template_path
 
 
 class Clock:
@@ -45,7 +46,9 @@ def test_start_builds_the_command_and_becomes_ready(settings):
         assert cmd[:2] == [settings.llama_server, "-m"] and cmd[2].endswith("LFM2.5-2.6B-Q8_0.gguf")
         for flag, value in (("--port", "9181"), ("-c", "32768"), ("-np", "4"), ("--device", "ROCm0"), ("--host", "127.0.0.1")):
             assert cmd[cmd.index(flag) + 1] == value
-        assert cmd[-3:] == ["--jinja", "--flash-attn", "on"]
+        assert cmd[-5:] == ["--jinja", "--reasoning-format", "deepseek", "--flash-attn", "on"]
+        template = cmd[cmd.index("--chat-template-file") + 1]            # the catalog entry's shipped template
+        assert template.endswith("lfm2-no-think.jinja") and Path(template).is_file()
         await f.tick()
         assert f.cards[0].state == "loading"
         f.http._transport = health({9181})
@@ -111,6 +114,25 @@ def test_missing_model_fails_clearly(settings):
             await f.start(0, "nope", 4096, 2, "")
         await f.http.aclose()
     asyncio.run(go())
+
+
+def test_a_template_the_install_lacks_fails_the_card_cleanly(settings):
+    async def go():
+        f, popen = fleet(settings, ready=set())
+        f.models._catalog[0]["chat_template"] = "missing.jinja"
+        await f.start(0, "lfm2.5-2.6b-q8", 8192, 4, "")
+        await f.tick()
+        assert f.cards[0].state == "failed" and "missing.jinja" in f.cards[0].error
+        assert popen.procs == [] and f.cards[0].config.running is False
+        await f.http.aclose()
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("name", ["../x.jinja", "x.txt", "/etc/passwd", "a b.jinja"])
+def test_chat_template_names_are_plain_files_in_the_package(name):
+    with pytest.raises(ValueError):
+        chat_template_path({"chat_template": name})
+    assert chat_template_path({}) is None
 
 
 @pytest.mark.parametrize("args", ["--port 1", "--host=0.0.0.0", "-m other.gguf", "--device ROCm1", "--path /", '"unclosed'])

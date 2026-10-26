@@ -7,6 +7,8 @@ import threading
 from pathlib import Path
 
 CATALOG = Path(__file__).with_name("catalog.json")
+TEMPLATES = Path(__file__).with_name("templates")   # Chat templates shipped with the balancer (*.jinja).
+TEMPLATE_NAME = re.compile(r"^[\w.-]+\.jinja$")
 REPO = re.compile(r"^[A-Za-z0-9][\w.-]{0,95}/[A-Za-z0-9][\w.-]{0,95}$")
 FILE = re.compile(r"^(?:[\w.-]+/){0,3}[\w.-]+\.gguf$")
 ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -20,6 +22,22 @@ def check_repo_file(repo: str, file: str) -> None:
         raise ValueError("Repository must look like owner/name.")
     if not FILE.match(file or "") or ".." in file:
         raise ValueError("File must be a .gguf path inside the repository.")
+
+
+def chat_template_path(entry: dict) -> Path | None:
+    """The shipped chat template a catalog entry names (chat_template), passed to llama-server as
+    --chat-template-file; None when the entry doesn't name one. Mnemerynne's lfm2-no-think.jinja is
+    LFM2.5's own template except that it thinks only when the request asks, so JSON calls (memory
+    extraction, follow-up questions) keep to their grammar."""
+    name = entry.get("chat_template")
+    if not name:
+        return None
+    if not TEMPLATE_NAME.match(str(name)) or ".." in str(name):
+        raise ValueError(f"Chat template {name!r} isn't a plain .jinja file name.")
+    path = TEMPLATES / str(name)
+    if not path.is_file():
+        raise ValueError(f"Chat template {name} isn't shipped with the balancer ({TEMPLATES}).")
+    return path
 
 
 def local_path(models_dir: Path, repo: str, file: str) -> Path:

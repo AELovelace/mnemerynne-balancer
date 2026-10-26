@@ -87,6 +87,15 @@ Open `http://<node>:9180/` and sign in with the password.
   - **Add from Hugging Face** lists a repository's `.gguf` files so you can
     add any of them.
   - Models live in `/var/lib/mnemerynne-balancer/models`.
+  - **Chat templates.** A catalog entry can name a template shipped in
+    `mnemerynne_balancer/templates/` (`"chat_template": "lfm2-no-think.jinja"`),
+    which the card gets as `--chat-template-file`. The LFM2.5 2.6B entries use
+    Mnemerynne's `lfm2-no-think.jinja` with `--reasoning-format deepseek`, the
+    same as Mnemerynne's own generator: the model thinks only when a request
+    asks, so JSON calls (memory extraction, follow-up questions) keep to their
+    grammar. LFM2.5's own template thinks on every request and breaks them. A
+    model added from Hugging Face gets no template; add `chat_template` to its
+    entry in `data/custom-models.json` if it's an LFM2.5 fine-tune.
 - **Cards tab.** Each card shows:
   - VRAM, including what npc-rag's copies use
   - temperature, hotspot and power

@@ -232,7 +232,8 @@ function modelRow(m) {
   if (m.source === "custom" && !busy && !m.in_use.length) acts.append(el("button", { class: "plain danger",
     onclick: () => confirm(`Remove ${m.name} from the list (and its file)?`) && post("/api/models/delete", { model: m.id, forget: true }) }, "Remove"));
   return el("tr", {}, el("td", {}, el("b", {}, m.name), el("div", { class: "small muted" }, `${m.repo} · ${m.file}`),
-      m.notes ? el("div", { class: "small muted" }, m.notes) : null),
+      m.notes ? el("div", { class: "small muted" }, m.notes) : null,
+      m.chat_template ? el("div", { class: "small muted" }, `Chat template: ${m.chat_template}`) : null),
     el("td", { class: "small" }, m.installed_bytes ? gb(m.installed_bytes) : d && d.total ? gb(d.total) : "–"), el("td", {}, state), el("td", {}, acts));
 }
 async function post(path, body) { try { await api("POST", path, body); refresh(); } catch (e) { toast(e.message); } }

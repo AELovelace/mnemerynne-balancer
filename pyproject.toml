@@ -24,7 +24,7 @@ build-backend = "setuptools.build_meta"
 packages = ["mnemerynne_balancer"]
 
 [tool.setuptools.package-data]
-mnemerynne_balancer = ["page.html", "catalog.json"]
+mnemerynne_balancer = ["page.html", "catalog.json", "templates/*.jinja"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

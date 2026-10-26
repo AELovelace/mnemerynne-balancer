@@ -166,7 +166,7 @@ def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, re
         listed = []
         for m in models.all():
             listed.append({**{k: m.get(k) for k in ("id", "name", "repo", "file", "kv_mib_per_1k", "ctx", "slots",
-                                                     "args", "notes", "source")},
+                                                     "args", "chat_template", "notes", "source")},
                            "installed_bytes": models.installed(m), "download": jobs.get(m["id"]),
                            "in_use": [c.index for c in fleet.cards if c.config.model == m["id"] and c.process is not None]})
         disk = shutil.disk_usage(s.data_dir if s.data_dir.exists() else Path("."))

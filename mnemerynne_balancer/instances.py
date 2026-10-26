@@ -19,7 +19,7 @@ import httpx
 
 from mnemerynne_balancer.config import Settings
 from mnemerynne_balancer.devices import child_env
-from mnemerynne_balancer.models import Models, estimate_mib
+from mnemerynne_balancer.models import Models, chat_template_path, estimate_mib
 
 LOG = logging.getLogger("balancer.instances")
 LINUX = os.name == "posix" and Path("/proc").is_dir()
@@ -182,9 +182,11 @@ class Fleet:
     # ------------------------------------------------------------ processes
     def command(self, card: Card, entry: dict) -> list[str]:
         cfg = card.config
+        template = chat_template_path(entry)
         return [self.settings.llama_server, "-m", str(self.models.path(entry)), "--host", self.settings.instance_host,
                 "--port", str(card.port), "-c", str(cfg.ctx * cfg.slots), "-np", str(cfg.slots), "-ngl", "999",
                 "--device", card.device, "--metrics", "--alias", entry["id"],
+                *(["--chat-template-file", str(template)] if template else []),
                 *check_args(entry.get("args", "")), *check_args(cfg.args)]
 
     def log_path(self, card: Card) -> Path:
@@ -197,7 +199,13 @@ class Fleet:
             card.config.running = False
             card.next_start = None
             return
-        cmd = self.command(card, entry)
+        try:
+            cmd = self.command(card, entry)
+        except ValueError as error:   # A template the entry names but this install doesn't ship.
+            card.state, card.error = "failed", str(error)
+            card.config.running = False
+            card.next_start = None
+            return
         log = self.log_path(card)
         log.parent.mkdir(parents=True, exist_ok=True)
         if log.is_file() and log.stat().st_size > 20 * 2**20:
