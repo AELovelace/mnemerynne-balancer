@@ -1,5 +1,6 @@
 """The OpenAI-compatible front door: /v1 requests go to the card serving the requested model, the less busy one
-when both do. /v1/balancer/load says how busy this node is (Mnemerynne picks between nodes with it)."""
+when both do. /v1/balancer/load says how busy this node is (Mnemerynne picks between nodes with it). On a BFGguf
+node there is one llama-server across every card, and only requests that name its model go to it."""
 from __future__ import annotations
 
 import hmac
@@ -31,12 +32,31 @@ def _names(fleet: Fleet, card: Card) -> set[str]:
 
 def candidates(fleet: Fleet, model: str | None) -> list[Card]:
     """Ready cards that can answer, least busy first (ties: lower card number). A model name that matches nothing
-    still works while only one model is running, so clients that send "local" or nothing keep working."""
-    ready = [c for c in fleet.cards if c.state == "ready" and c.config.model]
+    still works while only one model is running, so clients that send "local" or nothing keep working. Not on a
+    BFGguf node: there the model must be named, so a client asking for "local" goes to a balancer node instead."""
+    if fleet.switching:
+        return []
+    ready = [c for c in fleet.active() if c.state == "ready" and c.config.model]
     chosen = [c for c in ready if model and model.strip().lower() in _names(fleet, c)]
-    if not chosen and len({c.config.model for c in ready}) == 1:
+    if not chosen and len({c.config.model for c in ready}) == 1 and fleet.role != "bfgguf":
         chosen = ready
     return sorted(chosen, key=lambda c: (_busy(c), c.index))
+
+
+def load_view(fleet: Fleet) -> dict:
+    """GET /v1/balancer/load. Mnemerynne reads these keys (node, role, switching, models[].id/ready/in_flight/slots/
+    cards); keep them as they are."""
+    out: dict[str, dict] = {}
+    for c in fleet.active():
+        if not c.config.model or c.state not in ("ready", "loading"):
+            continue
+        m = out.setdefault(c.config.model, {"id": c.config.model, "ready": False, "in_flight": 0, "slots": 0, "cards": []})
+        m["cards"].extend(fleet.card_indices(c))
+        if c.state == "ready":
+            m["ready"] = True
+            m["in_flight"] += c.in_flight
+            m["slots"] += c.config.slots
+    return {"node": socket.gethostname(), "role": fleet.role, "switching": fleet.switching, "models": list(out.values())}
 
 
 def router(fleet: Fleet, api_key, transport: httpx.AsyncBaseTransport | None = None) -> APIRouter:
@@ -60,10 +80,16 @@ def router(fleet: Fleet, api_key, transport: httpx.AsyncBaseTransport | None = N
         except ValueError:
             raise HTTPException(400, "The request body must be JSON.") from None
         model = payload.get("model") if isinstance(payload, dict) else None
-        cards = candidates(fleet, model if isinstance(model, str) else None)
+        model = model if isinstance(model, str) else None
+        cards = candidates(fleet, model)
         if not cards:
-            running = sorted({c.config.model for c in fleet.cards if c.state == "ready" and c.config.model})
-            loading = [c.config.model for c in fleet.cards if c.state == "loading"]
+            if fleet.switching:
+                raise HTTPException(503, "This node is switching role; try another node or again shortly.")
+            only = fleet.bfgguf.config.model or "the model set on its page"
+            if fleet.role == "bfgguf" and not (model and model.strip().lower() in _names(fleet, fleet.bfgguf)):
+                raise HTTPException(404, f"This is a BFGguf node; it only serves {only}.")
+            running = sorted({c.config.model for c in fleet.active() if c.state == "ready" and c.config.model})
+            loading = [c.config.model for c in fleet.active() if c.state == "loading"]
             if loading:
                 raise HTTPException(503, f"{', '.join(loading)} is still loading; try again shortly.")
             if running:
@@ -90,7 +116,7 @@ def router(fleet: Fleet, api_key, transport: httpx.AsyncBaseTransport | None = N
                 release()
                 card.errors += 1
                 card.last_error = f"{type(error).__name__}: {error}"[:200]
-                failures.append(f"card {card.index}: {type(error).__name__}")
+                failures.append(f"{fleet.label(card).lower()}: {type(error).__name__}")
                 continue
 
             async def relay(upstream=upstream, release=release):
@@ -109,9 +135,11 @@ def router(fleet: Fleet, api_key, transport: httpx.AsyncBaseTransport | None = N
                 card.errors += 1
                 card.last_error = f"HTTP {upstream.status_code}"
             out = {k: v for k, v in upstream.headers.items() if k.lower() in FORWARDED_RESPONSE_HEADERS}
-            out["X-Balancer-Card"] = str(card.index)
+            out["X-Balancer-Card"] = ",".join(str(i) for i in fleet.card_indices(card))
             return StreamingResponse(relay(), status_code=upstream.status_code, headers=out,
                                      background=BackgroundTask(cleanup))
+        if fleet.switching:
+            raise HTTPException(503, "This node is switching role; try another node or again shortly.")
         raise HTTPException(503, "The card(s) serving that model didn't answer: " + "; ".join(failures))
 
     @api.post("/chat/completions")
@@ -130,27 +158,18 @@ def router(fleet: Fleet, api_key, transport: httpx.AsyncBaseTransport | None = N
     async def models(request: Request):
         authorize(request)
         seen: dict[str, list[int]] = {}
-        for c in fleet.cards:
+        for c in fleet.active():
             if c.state == "ready" and c.config.model:
-                seen.setdefault(c.config.model, []).append(c.index)
+                seen.setdefault(c.config.model, []).extend(fleet.card_indices(c))
         return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "mnemerynne-balancer",
                                             "cards": cards} for m, cards in seen.items()]}
 
     @api.get("/balancer/load")
     async def load(request: Request):
-        """This node's load per model: requests in flight against parallel slots, and whether it's ready."""
+        """This node's role and its load per model: requests in flight against parallel slots, and whether it's ready."""
         authorize(request)
-        out: dict[str, dict] = {}
-        for c in fleet.cards:
-            if not c.config.model or c.state not in ("ready", "loading"):
-                continue
-            m = out.setdefault(c.config.model, {"id": c.config.model, "ready": False, "in_flight": 0, "slots": 0, "cards": []})
-            m["cards"].append(c.index)
-            if c.state == "ready":
-                m["ready"] = True
-                m["in_flight"] += c.in_flight
-                m["slots"] += c.config.slots
-        return JSONResponse({"node": socket.gethostname(), "models": list(out.values())})
+        return JSONResponse(load_view(fleet))
 
     api.client = client  # So the app can close it on shutdown.
+    api.authorize = authorize  # POST /v1/balancer/role (in app.py) uses the same key.
     return api

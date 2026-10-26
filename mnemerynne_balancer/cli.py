@@ -36,7 +36,8 @@ def _models(s) -> int:
     models = Models(s.models_dir, s.custom_models_file)
     for m in models.all():
         size = models.installed(m)
-        print(f"{m['id']:28} {'downloaded' if size else '-':10} {m['repo']}/{m['file']}")
+        role = "bfgguf" if m.get("bfgguf") else ""
+        print(f"{m['id']:28} {'downloaded' if size else '-':10} {role:6} {m['repo']}/{m['file']}")
     return 0
 
 

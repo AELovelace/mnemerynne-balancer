@@ -321,6 +321,29 @@ pytest with injectable fakes, as `test_student_fleet.py` does:
    the node URLs and the key. Compare Erynne's speed against the RX 580
    with the same questions, and keep the RX 580 unit as a fallback.
 
+## The BFGguf role
+
+For a model too big for one card (Qwen3.6 35B-A3B, about 14 GB at IQ3), a
+node can switch roles: **balancer** (one llama-server per card, as above) or
+**bfgguf** (one llama-server across both cards: `--device ROCm0,ROCm1 -sm
+layer -ts 1,1`, on the first card's port).
+
+- The role and both configs (the cards', and the BFGguf's model, context,
+  slots and args) live in `state.json`; a node comes back in its last role.
+  `BALANCER_ROLE` only sets the role of a node with no saved state.
+- **Switching** takes every card lock, stops the running set, waits for its
+  processes to exit (VRAM freed), then starts the other set. New requests
+  get 503 "switching role" meanwhile, so Mnemerynne fails over. It's refused
+  (409) when the BFGguf model isn't downloaded, or doesn't fit the cards'
+  free VRAM added up (less the margin on each) unless "anyway".
+- **Who switches:** the control page, or `POST /v1/balancer/role` with the
+  API key, so Mnemerynne can turn a node into a BFGguf when it needs one.
+- **Routing:** a BFGguf node answers only requests that name its model; the
+  "one model running, any name works" rule is off, so `"local"` gets 404.
+  `/v1/balancer/load` always carries `role` and `switching`.
+- **Sharded GGUFs** (`-00001-of-0000N.gguf`) are one model: listed once,
+  every shard downloaded and checked, llama-server given the first.
+
 ## Open questions
 
 - **"Busy" isn't a usable load signal.** Both cards report 99% busy at

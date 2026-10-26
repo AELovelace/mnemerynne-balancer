@@ -12,7 +12,7 @@ from pathlib import Path
 
 import httpx
 
-from mnemerynne_balancer.models import check_repo_file, local_path
+from mnemerynne_balancer.models import SHARD, check_repo_file, local_path, shard_names
 
 LOG = logging.getLogger("balancer.downloads")
 HF = "https://huggingface.co"
@@ -29,7 +29,9 @@ def _headers(token: str) -> dict:
 
 
 def repo_files(client: httpx.Client, repo: str, token: str = "") -> list[dict]:
-    """Every .gguf in the repo (subfolders too): path, size and SHA-256."""
+    """Every .gguf in the repo (subfolders too): path, size and SHA-256. A sharded model (<stem>-00001-of-0000N.gguf)
+    is one entry: the first shard's path, the shards' sizes added up, and "shards" with each one's path, size and
+    SHA-256. A set with shards missing is left out, since llama-server couldn't load it."""
     check_repo_file(repo, "x.gguf")  # Validates the repo name; the file name is a placeholder.
     r = client.get(f"{HF}/api/models/{repo}/tree/main", params={"recursive": "true"}, headers=_headers(token))
     if r.status_code in (401, 403):
@@ -37,20 +39,30 @@ def repo_files(client: httpx.Client, repo: str, token: str = "") -> list[dict]:
     if r.status_code == 404:
         raise DownloadError("No such repository on Hugging Face.")
     r.raise_for_status()
-    out = []
+    out, sets = [], {}
     for f in r.json():
         if f.get("type") == "file" and f.get("path", "").endswith(".gguf"):
             lfs = f.get("lfs") or {}
-            out.append({"path": f["path"], "size": int(lfs.get("size") or f.get("size") or 0), "sha256": lfs.get("oid", "")})
+            one = {"path": f["path"], "size": int(lfs.get("size") or f.get("size") or 0), "sha256": lfs.get("oid", "")}
+            m = SHARD.match(one["path"])
+            if m and int(m.group(3)) > 1:
+                sets.setdefault((m.group(1), m.group(3)), []).append(one)
+            else:
+                out.append(one)
+    for shards in sets.values():
+        shards.sort(key=lambda f: f["path"])
+        if [f["path"] for f in shards] == shard_names(shards[0]["path"]):  # Complete, starting at 00001.
+            out.append({"path": shards[0]["path"], "size": sum(f["size"] for f in shards), "sha256": "", "shards": shards})
     return sorted(out, key=lambda f: f["path"])
 
 
 def resolve(client: httpx.Client, repo: str, file: str, token: str = "") -> dict:
-    """Size and SHA-256 of one file, from the HF API (never from the download itself)."""
+    """Size and SHA-256 of one file (of every shard, for a sharded model), from the HF API (never from the download
+    itself)."""
     check_repo_file(repo, file)
     for f in repo_files(client, repo, token):
         if f["path"] == file:
-            if not f["sha256"] or not f["size"]:
+            if not all(p["sha256"] and p["size"] for p in f.get("shards") or [f]):
                 raise DownloadError("Hugging Face didn't give a size and SHA-256 for that file, so it can't be verified.")
             return f
     raise DownloadError(f"{file} isn't in {repo}.")
@@ -145,49 +157,59 @@ class Downloader:
 
     def _run(self, client: httpx.Client, job: Job) -> None:
         spec = resolve(client, job.repo, job.file, self.token())
-        target = local_path(self.models_dir, job.repo, job.file)
-        job.total = spec["size"]
-        if target.is_file() and target.stat().st_size == spec["size"]:
-            job.received = job.total
-            return  # Already here (it was verified before it was renamed in).
-        partial = self.partial_path(job.repo, job.file)
-        partial.parent.mkdir(parents=True, exist_ok=True)
-        have = partial.stat().st_size if partial.is_file() else 0
-        if have > spec["size"]:
-            partial.unlink()
-            have = 0
-        free = shutil.disk_usage(partial.parent).free
-        if free < spec["size"] - have + DISK_SPARE:
-            raise DownloadError(f"Not enough disk space: {(spec['size'] - have) / 2**30:.1f} GB needed, "
-                                f"{free / 2**30:.1f} GB free.")
-        job.state = "downloading"
-        job.received = have
-        if have < spec["size"]:
-            self._stream(client, job, partial, have, spec["size"])
-        job.state = "verifying"
-        if partial.stat().st_size != spec["size"] or sha256_of(partial, job.cancel) != spec["sha256"]:
-            partial.unlink(missing_ok=True)  # A bad file must not be resumed: start clean next time.
-            raise DownloadError("The download didn't match Hugging Face's SHA-256; it was deleted. Try again.")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        partial.replace(target)
+        parts = spec.get("shards") or [spec]   # A sharded model: every shard, each resumed and checked on its own.
+        job.total = sum(p["size"] for p in parts)
+        todo, received = [], 0
+        for p in parts:
+            target = local_path(self.models_dir, job.repo, p["path"])
+            if target.is_file() and target.stat().st_size == p["size"]:
+                received += p["size"]
+                continue  # Already here (it was verified before it was renamed in).
+            partial = self.partial_path(job.repo, p["path"])
+            partial.parent.mkdir(parents=True, exist_ok=True)
+            have = partial.stat().st_size if partial.is_file() else 0
+            if have > p["size"]:
+                partial.unlink()
+                have = 0
+            received += have
+            todo.append((p, target, partial, have))
+        job.received = received
+        if not todo:
+            return
+        missing = sum(p["size"] - have for p, _, _, have in todo)
+        free = shutil.disk_usage(todo[0][2].parent).free
+        if free < missing + DISK_SPARE:
+            raise DownloadError(f"Not enough disk space: {missing / 2**30:.1f} GB needed, {free / 2**30:.1f} GB free.")
+        for p, target, partial, have in todo:
+            job.state = "downloading"
+            if have < p["size"]:
+                self._stream(client, job, p["path"], partial, have, p["size"])
+            job.state = "verifying"
+            if partial.stat().st_size != p["size"] or sha256_of(partial, job.cancel) != p["sha256"]:
+                partial.unlink(missing_ok=True)  # A bad file must not be resumed: start clean next time.
+                raise DownloadError("The download didn't match Hugging Face's SHA-256; it was deleted. Try again.")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            partial.replace(target)
 
-    def _stream(self, client: httpx.Client, job: Job, partial: Path, have: int, size: int) -> None:
-        url = f"{HF}/{job.repo}/resolve/main/{job.file}"
+    def _stream(self, client: httpx.Client, job: Job, file: str, partial: Path, have: int, size: int) -> None:
+        url = f"{HF}/{job.repo}/resolve/main/{file}"
         headers = {**_headers(self.token()), **({"Range": f"bytes={have}-"} if have else {})}
-        window: list[tuple[float, int]] = [(time.monotonic(), have)]
+        before = job.received - have  # Bytes of the other shards, already counted.
+        window: list[tuple[float, int]] = [(time.monotonic(), job.received)]
         with client.stream("GET", url, headers=headers) as response:
             if response.status_code in (401, 403):
                 raise DownloadError("Hugging Face refused the download: the repo is gated (set an HF token).")
             response.raise_for_status()
             if have and response.status_code != 206:
                 have = 0  # The server ignored the Range header: start over.
-            job.received = have
+            job.received = before + have
             with partial.open("ab" if have else "wb") as out:
                 for chunk in response.iter_bytes(CHUNK):
                     if job.cancel.is_set():
                         raise DownloadError("cancelled")
-                    job.received += len(chunk)
-                    if job.received > size:
+                    have += len(chunk)
+                    job.received = before + have
+                    if have > size:
                         raise DownloadError("The download is bigger than Hugging Face said it would be.")
                     out.write(chunk)
                     now = time.monotonic()

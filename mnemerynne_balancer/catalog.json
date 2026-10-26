@@ -1,5 +1,5 @@
 {
-  "_comment": "Known-good models. Size and SHA-256 come from Hugging Face at download time. kv_mib_per_1k: KV cache per 1,000 tokens of context at f16 (attention layers x KV heads x head size x 4 bytes), used for the VRAM check. ctx is per slot. chat_template: a file in mnemerynne_balancer/templates passed as --chat-template-file.",
+  "_comment": "Known-good models. Size and SHA-256 come from Hugging Face at download time. kv_mib_per_1k: KV cache per 1,000 tokens of context at f16 (attention layers x KV heads x head size x 4 bytes), used for the VRAM check. ctx is per slot. chat_template: a file in mnemerynne_balancer/templates passed as --chat-template-file. bfgguf: true for a model too big for one card, offered only for the BFGguf (one llama-server across every card). file: for a sharded model, the first shard (-00001-of-0000N.gguf); the rest come with it.",
   "models": [
     {"id": "lfm2.5-2.6b-q8", "name": "LFM2.5 2.6B Q8_0", "repo": "LiquidAI/LFM2.5-2.6B-GGUF", "file": "LFM2.5-2.6B-Q8_0.gguf",
      "kv_mib_per_1k": 16, "ctx": 8192, "slots": 4, "args": "--jinja --reasoning-format deepseek",
@@ -22,6 +22,10 @@
      "kv_mib_per_1k": 144, "ctx": 8192, "slots": 2, "args": "--jinja -fa off", "notes": ""},
     {"id": "qwen3-8b-q4", "name": "Qwen3 8B Q4_K_M", "repo": "Qwen/Qwen3-8B-GGUF", "file": "Qwen3-8B-Q4_K_M.gguf",
      "kv_mib_per_1k": 144, "ctx": 4096, "slots": 2, "args": "--jinja -fa off",
-     "notes": "About 5 GB: fits next to npc-rag's copies with a small context."}
+     "notes": "About 5 GB: fits next to npc-rag's copies with a small context."},
+    {"id": "qwen3.6-35b-a3b", "name": "Qwen3.6 35B-A3B (BFGguf)", "bfgguf": true,
+     "repo": "unsloth/Qwen3.6-35B-A3B-GGUF", "file": "Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+     "kv_mib_per_1k": 20, "ctx": 8192, "slots": 2, "args": "--jinja -fa off",
+     "notes": "BFGguf only: 13.7 GB, split across both cards. Mixture of experts (256 experts, 8 active, about 3B active per token). Hybrid attention: 10 of 40 layers use full attention (2 KV heads x 256), the rest Gated DeltaNet with a small fixed state per slot, so context is cheap. Needs a llama.cpp build that knows the qwen35moe architecture. -fa off: flash attention crashes on the RX 6800s."}
   ]
 }

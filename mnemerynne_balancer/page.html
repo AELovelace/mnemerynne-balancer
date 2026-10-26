@@ -43,6 +43,8 @@ pre { background:var(--bar); padding:10px; border-radius:8px; overflow:auto; max
 .form { display:grid; grid-template-columns:repeat(auto-fit, minmax(120px, 1fr)); gap:8px; margin-top:10px; }
 #login { max-width:340px; margin:80px auto; }
 .table-wrap { overflow-x:auto; }
+.rolebar { margin-bottom:14px; }
+.rolebar h3 { margin-right:6px; }
 #toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:var(--ink); color:var(--bg); padding:8px 14px; border-radius:8px; display:none; max-width:90vw; }
 </style>
 </head>
@@ -62,7 +64,7 @@ pre { background:var(--bar); padding:10px; border-radius:8px; overflow:auto; max
   <button id="logout">Sign out</button></nav>
 </header>
 <main>
-  <section id="cards" class="on"><div class="grid" id="card-grid"></div>
+  <section id="cards" class="on"><div id="role-bar"></div><div class="grid" id="card-grid"></div>
     <div id="log-wrap" hidden><h2 id="log-title">Log</h2><pre id="log"></pre></div></section>
   <section id="models">
     <h2>Models</h2><div class="tile table-wrap"><table><thead><tr><th>Model</th><th>Size</th><th>State</th><th></th></tr></thead>
@@ -87,7 +89,8 @@ pre { background:var(--bar); padding:10px; border-radius:8px; overflow:auto; max
     <h2>Using it</h2>
     <div class="tile small"><p>OpenAI-compatible address: <code id="v1-url"></code>, with <code>Authorization: Bearer &lt;API key&gt;</code>.
     Send <code>model</code> as a model id from the Models tab; while only one model runs, any name works.</p>
-    <p>Load for other balancers or Mnemerynne: <code>GET /v1/balancer/load</code>.</p>
+    <p>Load for other balancers or Mnemerynne: <code>GET /v1/balancer/load</code> (with <code>role</code> and <code>switching</code>).
+    Switch this node with <code>POST /v1/balancer/role</code> and <code>{"role": "bfgguf"}</code> or <code>{"role": "balancer"}</code>.</p>
     <p class="muted">llama-server: <code id="llama-path"></code> · VRAM margin <span id="margin"></span> MB · disk free <span id="disk"></span> GB</p></div>
   </section>
   <section id="activity"><h2>Activity</h2><div class="tile table-wrap"><table><thead><tr><th>When</th><th>From</th><th>What</th></tr></thead>
@@ -168,7 +171,7 @@ function cardTile(c) {
 }
 
 function startForm(c) {
-  const ready = status.models.filter(m => m.installed_bytes);
+  const ready = status.models.filter(m => m.installed_bytes && !m.bfgguf);
   if (!ready.length) return el("p", { class: "small muted" }, "Download a model on the Models tab first.");
   const sel = el("select", {}, ready.map(m => el("option", { value: m.id, selected: m.id === c.config.model }, m.name)));
   const ctx = el("input", { type: "number", min: 256, step: 256 }), slots = el("input", { type: "number", min: 1, max: 64 });
@@ -206,23 +209,151 @@ async function stopCard(i) {
   if (!confirm(`Stop card ${i}? Requests for its model go to the other card, or fail if none serves it.`)) return;
   try { await api("POST", `/api/cards/${i}/stop`); refresh(); } catch (e) { toast(e.message); }
 }
-async function showLog(i) { logCard = i; $("log-wrap").hidden = false; $("log-title").textContent = `Card ${i} log`; await loadLog(); $("log-wrap").scrollIntoView({ behavior: "smooth" }); }
+async function showLog(i) { logCard = i; $("log-wrap").hidden = false; $("log-title").textContent = i === "bfgguf" ? "BFGguf log" : `Card ${i} log`; await loadLog(); $("log-wrap").scrollIntoView({ behavior: "smooth" }); }
 async function loadLog() {
   if (logCard === null) return;
   const pre = $("log"), atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
-  pre.textContent = (await api("GET", `/api/cards/${logCard}/log?lines=200`)).text || "(empty)";
+  pre.textContent = (await api("GET", logCard === "bfgguf" ? "/api/bfgguf/log?lines=200" : `/api/cards/${logCard}/log?lines=200`)).text || "(empty)";
   if (atEnd) pre.scrollTop = pre.scrollHeight;
 }
 
+// ------------------------------------------------------------ BFGguf: one llama-server across every card
+function roleBar() {
+  const b = status.bfgguf, cfg = b.config, isB = status.role === "bfgguf";
+  const pick = (role, text) => el("button", { class: status.role === role ? "act" : "plain",
+    disabled: status.switching || status.role === role, onclick: () => switchRole(role) }, text);
+  const what = cfg.model ? `${modelName(cfg.model)} (${cfg.slots} × ${cfg.ctx} ctx)` : "no model yet";
+  const bar = el("div", { class: "tile rolebar" },
+    el("div", { class: "row" }, el("h3", {}, "Role"), pick("balancer", "Balancer"), pick("bfgguf", "BFGguf"),
+      status.switching ? el("span", { class: "state loading" }, "switching") : null),
+    el("div", { class: "small muted", style: "margin-top:6px" }, isB
+      ? `BFGguf: one llama-server across every card, serving only ${modelName(cfg.model)}. Requests for any other model get 404, so clients use another node.`
+      : `Balancer: one llama-server per card. BFGguf would run ${what} across every card instead.`));
+  if (!isB) {
+    bar.append(el("div", { class: "row", style: "margin-top:8px" },
+      el("button", { class: "plain", onclick: () => { openForm = openForm === "bfgguf" ? null : "bfgguf"; formState = null; render(); } }, "BFGguf settings")),
+      ...downloadsFor(bfggufChoices()));
+    if (openForm === "bfgguf") bar.append(bfggufForm());
+  }
+  return bar;
+}
+
+async function switchRole(role) {
+  const cfg = status.bfgguf.config;
+  const text = role === "bfgguf"
+    ? `Switch this node to BFGguf? Every card's llama-server stops, then ${modelName(cfg.model)} starts across all cards. Requests get 503 while it switches, then wait for it to load.`
+    : "Switch back to Balancer? The BFGguf stops, then each card starts its own model again.";
+  if (!confirm(text)) return;
+  const go = async (anyway) => {
+    try {
+      await api("POST", "/api/role", { role, anyway });
+      openForm = null; formState = null; toast(role === "bfgguf" ? "Switched to BFGguf; it's loading." : "Switched to Balancer."); refresh();
+    } catch (e) {
+      if (e.status === 409 && e.data.fit && !anyway) { if (confirm(e.message + "\n\nSwitch anyway?")) go(true); }
+      else toast(e.message);
+    }
+  };
+  go(false);
+}
+
+const bfggufChoices = () => status.models.filter(m => m.bfgguf || m.source === "custom");
+const busyDownload = (d) => d && ["queued", "downloading", "verifying"].includes(d.state);
+function progress(d) {
+  const pct = d.total ? Math.floor(100 * d.received / d.total) : 0;
+  return el("div", {}, el("div", { class: "bar" }, el("div", { style: `width:${pct}%` })),
+    el("span", { class: "small muted" }, d.state === "verifying" ? "checking SHA-256…" :
+      `${pct}% · ${(d.speed / 2 ** 20).toFixed(1)} MB/s` + (d.eta_s != null ? ` · ${ago(d.eta_s)} left` : "")));
+}
+function downloadsFor(models) {
+  return models.filter(m => busyDownload(m.download)).map(m => el("div", { class: "small", style: "margin-top:8px" }, `Downloading ${m.name}`, progress(m.download)));
+}
+function fitText(f) {
+  if (!f) return "";
+  if (!f.known) return `Needs about ${mib(f.needed_mib)}; free VRAM is unknown.`;
+  return `Needs about ${mib(f.needed_mib)} of ${mib(f.available_mib)} free across the cards (after the margin)` + (f.fits ? "." : ": it doesn't fit.");
+}
+
+function bfggufTile() {
+  const b = status.bfgguf, cfg = b.config;
+  const tile = el("div", { class: "tile", style: "grid-column:1/-1" });
+  tile.append(el("div", { class: "row" }, el("h3", {}, `BFGguf · ${b.device}`), el("span", { class: "state " + b.state }, b.state)),
+    el("div", { class: "muted small" }, `One llama-server on cards ${b.cards.join(" and ")}, layers split evenly (-sm layer) · port ${b.port}`));
+  for (const c of status.cards) {
+    const r = c.reading;
+    if (!r) continue;
+    const pct = Math.round(100 * r.vram_used_mib / r.vram_total_mib);
+    tile.append(el("div", { class: "bar" }, el("div", { style: `width:${pct}%` })),
+      el("div", { class: "small muted" }, `Card ${c.index} · ${c.device}: VRAM ${mib(r.vram_used_mib)} of ${mib(r.vram_total_mib)} used · ${mib(r.vram_free_mib)} free` +
+        (r.temp_c != null ? ` · ${Math.round(r.temp_c)} °C` : "") + (r.power_w != null ? ` · ${r.power_w} W` : "")));
+  }
+  tile.append(el("div", { class: "stats" },
+    el("div", {}, el("b", {}, modelName(cfg.model)), cfg.model ? `${cfg.slots} × ${cfg.ctx} ctx` : "model"),
+    el("div", {}, el("b", {}, `${b.in_flight} / ${cfg.slots}`), "in flight / slots"),
+    el("div", {}, el("b", {}, b.tokens_per_s != null ? b.tokens_per_s : "–"), "tokens/s"),
+    el("div", {}, el("b", {}, b.requests), `requests · ${b.errors} errors`),
+    el("div", {}, el("b", {}, ago(b.uptime_s)), "uptime"),
+    el("div", {}, el("b", {}, b.restarts), "restarts")));
+  if (b.fit) tile.append(el("div", { class: "small " + (b.fit.fits ? "muted" : "error") }, fitText(b.fit)));
+  const m = status.models.find(m => m.id === cfg.model);
+  if (m && !m.installed_bytes && !busyDownload(m.download)) tile.append(el("div", { class: "row small", style: "margin-top:8px" },
+    `${m.name} isn't downloaded.`, el("button", { class: "act", onclick: () => post("/api/models/download", { model: m.id }) }, "Download")));
+  tile.append(...downloadsFor(bfggufChoices()));
+  if (b.error) tile.append(el("div", { class: "error" }, b.error.split("\n").slice(0, 6).join("\n")));
+  if (b.last_error) tile.append(el("div", { class: "small muted" }, "Last proxy error: " + b.last_error));
+  tile.append(el("div", { class: "row", style: "margin-top:10px" },
+    el("button", { class: "act", onclick: () => { openForm = openForm === "bfgguf" ? null : "bfgguf"; render(); } }, "Change model"),
+    el("button", { class: "plain", onclick: () => showLog("bfgguf") }, "Log")));
+  if (openForm === "bfgguf") tile.append(bfggufForm());
+  return tile;
+}
+
+function bfggufForm() {
+  const live = status.role === "bfgguf", cfg = status.bfgguf.config, choices = bfggufChoices();
+  if (!choices.length) return el("p", { class: "small muted" }, "No BFGguf models in the catalog; add one from Hugging Face on the Models tab.");
+  const sel = el("select", {}, choices.map(m => el("option", { value: m.id, selected: m.id === cfg.model },
+    m.name + (m.installed_bytes ? "" : " (not downloaded)"))));
+  const ctx = el("input", { type: "number", min: 256, step: 256 }), slots = el("input", { type: "number", min: 1, max: 64 });
+  const args = el("input", { placeholder: "e.g. --flash-attn on" });
+  const keep = () => { formState = { card: "bfgguf", model: sel.value, ctx: ctx.value, slots: slots.value, args: args.value }; };
+  const fill = () => { const m = choices.find(m => m.id === sel.value); const same = m.id === cfg.model;
+    ctx.value = same ? cfg.ctx : m.ctx; slots.value = same ? cfg.slots : m.slots; args.value = same ? cfg.args : ""; keep(); };
+  sel.onchange = fill;
+  if (formState && formState.card === "bfgguf" && choices.some(m => m.id === formState.model)) {
+    sel.value = formState.model; ctx.value = formState.ctx; slots.value = formState.slots; args.value = formState.args;
+  } else fill();
+  [ctx, slots, args].forEach(i => i.addEventListener("input", keep));
+  const msg = el("div", { class: "error" });
+  const go = async (force) => {
+    msg.textContent = "";
+    try {
+      await api("POST", "/api/bfgguf", { model: sel.value, ctx: +ctx.value, slots: +slots.value, args: args.value, force });
+      openForm = null; formState = null; toast(live ? "Restarting the BFGguf with " + modelName(sel.value) : "Saved; it's used when you switch to BFGguf."); refresh();
+    } catch (e) {
+      if (e.status === 409 && e.data.fit) {
+        msg.textContent = fitText(e.data.fit) + " Lower context or slots, or start anyway.";
+        msg.append(" ", el("button", { class: "plain danger", onclick: () => go(true) }, "Start anyway"));
+      } else msg.textContent = e.message;
+    }
+  };
+  const download = async () => {
+    try { await api("POST", "/api/models/download", { model: sel.value }); openForm = null; formState = null; toast("Downloading " + modelName(sel.value)); refresh(); }
+    catch (e) { msg.textContent = e.message; }
+  };
+  const chosen = () => choices.find(m => m.id === sel.value);
+  return el("div", {}, el("div", { class: "form" },
+      el("label", { style: "grid-column:1/-1" }, "Model", sel), el("label", {}, "Context per slot", ctx),
+      el("label", {}, "Slots", slots), el("label", { style: "grid-column:1/-1" }, "Extra llama-server args", args)),
+    el("div", { class: "row", style: "margin-top:8px" },
+      el("button", { class: "act", onclick: () => go(false) }, live ? "Restart with these" : "Save"),
+      el("button", { class: "plain", onclick: () => chosen().installed_bytes ? toast("Already downloaded.") : download() }, "Download"),
+      el("button", { class: "plain", onclick: () => { openForm = null; formState = null; render(); } }, "Cancel")), msg);
+}
+
 function modelRow(m) {
-  const d = m.download, busy = d && ["queued", "downloading", "verifying"].includes(d.state);
+  const d = m.download, busy = busyDownload(d);
   let state;
-  if (busy) {
-    const pct = d.total ? Math.floor(100 * d.received / d.total) : 0;
-    state = el("div", {}, el("div", { class: "bar" }, el("div", { style: `width:${pct}%` })),
-      el("span", { class: "small muted" }, d.state === "verifying" ? "checking SHA-256…" :
-        `${pct}% · ${(d.speed / 2 ** 20).toFixed(1)} MB/s` + (d.eta_s != null ? ` · ${ago(d.eta_s)} left` : "")));
-  } else if (m.installed_bytes) state = el("span", { class: "small" }, m.in_use.length ? `on card ${m.in_use.join(", ")}` : "downloaded");
+  if (busy) state = progress(d);
+  else if (m.installed_bytes) state = el("span", { class: "small" }, m.in_use.length ? `on card ${m.in_use.join(", ")}` : "downloaded");
   else state = el("span", { class: "small " + (d && d.state === "failed" ? "error" : "muted") }, d && d.state === "failed" ? d.error : "not downloaded");
   const acts = el("div", { class: "row" });
   if (busy) acts.append(el("button", { class: "plain", onclick: () => post("/api/models/cancel", { model: m.id }) }, "Cancel"));
@@ -231,7 +362,8 @@ function modelRow(m) {
     onclick: () => confirm(`Delete ${m.name} from disk?`) && post("/api/models/delete", { model: m.id }) }, "Delete"));
   if (m.source === "custom" && !busy && !m.in_use.length) acts.append(el("button", { class: "plain danger",
     onclick: () => confirm(`Remove ${m.name} from the list (and its file)?`) && post("/api/models/delete", { model: m.id, forget: true }) }, "Remove"));
-  return el("tr", {}, el("td", {}, el("b", {}, m.name), el("div", { class: "small muted" }, `${m.repo} · ${m.file}`),
+  return el("tr", {}, el("td", {}, el("b", {}, m.name), el("div", { class: "small muted" }, `${m.repo} · ${m.file}` + (m.shards > 1 ? ` (+${m.shards - 1} more shards)` : "")),
+      m.bfgguf ? el("div", { class: "small muted" }, "BFGguf only: runs across every card.") : null,
       m.notes ? el("div", { class: "small muted" }, m.notes) : null,
       m.chat_template ? el("div", { class: "small muted" }, `Chat template: ${m.chat_template}`) : null),
     el("td", { class: "small" }, m.installed_bytes ? gb(m.installed_bytes) : d && d.total ? gb(d.total) : "–"), el("td", {}, state), el("td", {}, acts));
@@ -278,8 +410,9 @@ async function loadAudit() {
 
 function render() {
   if (!status) return;
-  $("node").textContent = `${status.node} · :${status.port}`;
-  $("card-grid").replaceChildren(...status.cards.map(cardTile));
+  $("node").textContent = `${status.node} · :${status.port}` + (status.role === "bfgguf" ? " · BFGguf" : "");
+  $("role-bar").replaceChildren(roleBar());
+  $("card-grid").replaceChildren(...(status.role === "bfgguf" ? [bfggufTile()] : status.cards.map(cardTile)));
   $("model-rows").replaceChildren(...status.models.map(modelRow));
   $("key-state").textContent = status.secrets.api_key ? "(set)" : "(not set: /v1 refuses everything)";
   $("hf-state").textContent = status.secrets.hf_token ? "(set)" : "(not set)";

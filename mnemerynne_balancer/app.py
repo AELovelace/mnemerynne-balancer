@@ -23,8 +23,8 @@ from mnemerynne_balancer import devices as dev
 from mnemerynne_balancer import proxy
 from mnemerynne_balancer.config import Secrets, Settings
 from mnemerynne_balancer.downloads import Downloader, DownloadError, repo_files
-from mnemerynne_balancer.instances import Fleet
-from mnemerynne_balancer.models import Models
+from mnemerynne_balancer.instances import BFGGUF_NODE, ROLES, Fleet, RoleRefused
+from mnemerynne_balancer.models import Models, shard_names
 
 LOG = logging.getLogger("balancer.app")
 PAGE = Path(__file__).with_name("page.html")
@@ -106,6 +106,30 @@ def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, re
             raise HTTPException(404, "unknown model")
         return entry
 
+    async def matched_readings() -> list[dict | None]:
+        """One reading per card (None where it couldn't be matched)."""
+        readings = await asyncio.to_thread(read_cards)
+        return dev.match_readings([{"mib": c.vram_mib} for c in fleet.cards], readings)
+
+    async def switch(request: Request, data: dict, via: str) -> JSONResponse | None:
+        """Change the role (the page and POST /v1/balancer/role). A refusal comes back as a 409 response."""
+        role, anyway = data.get("role"), data.get("anyway", False)
+        if role not in ROLES:
+            raise HTTPException(422, 'Send "role": "balancer" or "bfgguf".')
+        if not isinstance(anyway, bool):
+            raise HTTPException(422, '"anyway" must be true or false.')
+        before = fleet.role
+        try:
+            await fleet.set_role(role, anyway, await matched_readings())
+        except RoleRefused as error:
+            extra = {"fit": error.fit} if error.fit and via == "page" else {}
+            return JSONResponse({"detail": str(error), **extra}, status_code=409)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from None
+        if role != before:
+            audit(request, "role", role=role, before=before, anyway=anyway, via=via)
+        return None
+
     @app.middleware("http")
     async def headers(request: Request, call_next):
         response = await call_next(request)
@@ -122,7 +146,7 @@ def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, re
 
     @app.get("/healthz")
     async def healthz():
-        return {"ok": True, "ready_cards": sum(c.state == "ready" for c in fleet.cards)}
+        return {"ok": True, "role": fleet.role, "ready_cards": sum(c.state == "ready" for c in fleet.active())}
 
     @app.post("/api/login")
     async def login(request: Request):
@@ -159,24 +183,33 @@ def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, re
     @app.get("/api/status")
     async def status(request: Request):
         require(request)
-        readings = await asyncio.to_thread(read_cards)
-        matched = dev.match_readings([{"mib": c.vram_mib} for c in fleet.cards], readings)
+        matched = await matched_readings()
         cards = [dict(c.view(), reading=r) for c, r in zip(fleet.cards, matched)]
         jobs = {j["model"]: j for j in downloader.view()}
         listed = []
         for m in models.all():
+            in_use = [c.index for c in fleet.cards if c.config.model == m["id"] and c.process is not None]
+            if fleet.bfgguf.config.model == m["id"] and fleet.bfgguf.process is not None:
+                in_use = fleet.card_indices(fleet.bfgguf)
             listed.append({**{k: m.get(k) for k in ("id", "name", "repo", "file", "kv_mib_per_1k", "ctx", "slots",
                                                      "args", "chat_template", "notes", "source")},
-                           "installed_bytes": models.installed(m), "download": jobs.get(m["id"]),
-                           "in_use": [c.index for c in fleet.cards if c.config.model == m["id"] and c.process is not None]})
+                           "bfgguf": bool(m.get("bfgguf")), "shards": len(shard_names(m["file"])),
+                           "installed_bytes": models.installed(m), "download": jobs.get(m["id"]), "in_use": in_use})
+        bfgguf = fleet.bfgguf_view()
+        entry = models.get(fleet.bfgguf.config.model or "")
+        bfgguf["fit"] = fleet.fit_bfgguf(entry, fleet.bfgguf.config.ctx, fleet.bfgguf.config.slots, matched) \
+            if entry and models.installed(entry) else None
         disk = shutil.disk_usage(s.data_dir if s.data_dir.exists() else Path("."))
-        return {"node": socket.gethostname(), "cards": cards, "models": listed, "secrets": secret_store.status(),
+        return {"node": socket.gethostname(), "role": fleet.role, "switching": fleet.switching, "bfgguf": bfgguf,
+                "cards": cards, "models": listed, "secrets": secret_store.status(),
                 "disk_free_gb": round(disk.free / 2**30, 1), "llama_server": s.llama_server,
                 "port": s.port, "vram_margin_mb": s.vram_margin_mb}
 
     @app.post("/api/cards/{index}/start")
     async def start(index: int, request: Request):
         require(request, post=True)
+        if fleet.role == "bfgguf":
+            raise HTTPException(409, BFGGUF_NODE)
         data = await body(request)
         entry = entry_or_404(data.get("model"))
         try:
@@ -185,15 +218,14 @@ def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, re
         except (KeyError, ValueError):
             raise HTTPException(400, "bad card, context or slots") from None
         args = str(data.get("args", ""))
-        readings = await asyncio.to_thread(read_cards)
-        reading = dev.match_readings([{"mib": c.vram_mib} for c in fleet.cards], readings)[index]
+        reading = (await matched_readings())[index]
         fit = fleet.fit(index, entry, ctx, slots, reading)
         if not fit["fits"] and not data.get("force"):
             return JSONResponse({"error": "doesn't fit", "fit": fit}, status_code=409)
         try:
             await fleet.start(index, entry["id"], ctx, slots, args)
         except ValueError as error:
-            raise HTTPException(400, str(error)) from None
+            raise HTTPException(409 if str(error) == BFGGUF_NODE else 400, str(error)) from None
         audit(request, "card_start", card=index, model=entry["id"], ctx=ctx, slots=slots, forced=bool(data.get("force")))
         return {"ok": True, "fit": fit}
 
@@ -204,6 +236,8 @@ def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, re
             await fleet.stop(index)
         except KeyError:
             raise HTTPException(404, "no such card") from None
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from None
         audit(request, "card_stop", card=index)
         return {"ok": True}
 
@@ -214,6 +248,56 @@ def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, re
             return {"text": await asyncio.to_thread(fleet.log_tail, index, max(20, min(2000, lines)))}
         except KeyError:
             raise HTTPException(404, "no such card") from None
+
+    @app.post("/api/bfgguf")
+    async def bfgguf_change(request: Request):
+        """The BFGguf's model, context and slots: restarts it on a BFGguf node, only saves them on a balancer node."""
+        require(request, post=True)
+        data = await body(request)
+        entry = entry_or_404(data.get("model"))
+        try:
+            ctx, slots = int(data.get("ctx") or entry["ctx"]), int(data.get("slots") or entry["slots"])
+        except (KeyError, ValueError):
+            raise HTTPException(400, "bad context or slots") from None
+        args = str(data.get("args", ""))
+        fit = None
+        if fleet.role == "bfgguf" and models.installed(entry):
+            fit = fleet.fit_bfgguf(entry, ctx, slots, await matched_readings())
+            if not fit["fits"] and not data.get("force"):
+                return JSONResponse({"error": "doesn't fit", "fit": fit}, status_code=409)
+        try:
+            await fleet.start_bfgguf(entry["id"], ctx, slots, args)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from None
+        audit(request, "bfgguf_change", model=entry["id"], ctx=ctx, slots=slots, restarted=fleet.role == "bfgguf",
+              forced=bool(data.get("force")))
+        return {"ok": True, "fit": fit, "restarted": fleet.role == "bfgguf"}
+
+    @app.get("/api/bfgguf/log")
+    async def bfgguf_log(request: Request, lines: int = 200):
+        require(request)
+        path = fleet.log_path(fleet.bfgguf)
+        return {"text": await asyncio.to_thread(fleet.tail, path, max(20, min(2000, lines)))}
+
+    @app.post("/api/role")
+    async def role(request: Request):
+        require(request, post=True)
+        refused = await switch(request, await body(request), "page")
+        return refused or {"ok": True, "role": fleet.role}
+
+    @app.post("/v1/balancer/role")
+    async def v1_role(request: Request):
+        """Mnemerynne (or anyone with the API key) switches this node: {"role": "bfgguf"|"balancer", "anyway": false}.
+        Answers with the same JSON as GET /v1/balancer/load, after the switch."""
+        v1.authorize(request)
+        try:
+            data = json.loads(await request.body() or b"{}")
+        except ValueError:
+            raise HTTPException(422, "The request body must be JSON.") from None
+        if not isinstance(data, dict):
+            raise HTTPException(422, "The request body must be a JSON object.")
+        refused = await switch(request, data, "api")
+        return refused or JSONResponse(proxy.load_view(fleet))
 
     @app.post("/api/models/download")
     async def download(request: Request):
@@ -236,11 +320,14 @@ def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, re
         entry = entry_or_404(data.get("model"))
         if any(c.config.model == entry["id"] and (c.process is not None or c.config.running) for c in fleet.cards):
             raise HTTPException(409, "A card is using that model; stop it first.")
+        bfgguf = fleet.bfgguf
+        if bfgguf.config.model == entry["id"] and (bfgguf.process is not None or fleet.role == "bfgguf"):
+            raise HTTPException(409, "The BFGguf is using that model; switch back to balancer first.")
         if downloader.active(entry["id"]):
             raise HTTPException(409, "It's downloading; cancel that first.")
-        path = models.path(entry)
-        path.unlink(missing_ok=True)
-        downloader.partial_path(entry["repo"], entry["file"]).unlink(missing_ok=True)
+        for path, file in zip(models.paths(entry), shard_names(entry["file"])):  # Every shard, half-downloaded ones too.
+            path.unlink(missing_ok=True)
+            downloader.partial_path(entry["repo"], file).unlink(missing_ok=True)
         if data.get("forget") and entry.get("source") == "custom":
             models.remove_custom(entry["id"])
         audit(request, "model_delete", model=entry["id"], forget=bool(data.get("forget")))

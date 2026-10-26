@@ -111,7 +111,8 @@ Open `http://<node>:9180/` and sign in with the password.
 - **Crashes.** A crashed llama-server restarts after 5 s, then 10, 20, 40,
   up to 60 s. After 5 crashes in 10 minutes the card is marked `failed` with
   the end of its log.
-- **Reboots.** Whatever was running before a reboot starts again.
+- **Reboots.** Whatever was running before a reboot starts again, in the
+  same role (see BFGguf below).
 - **Settings tab.** Replace the API key (there's a **Generate** button) or
   set a Hugging Face token for gated repos. Both are write-only.
 - **Activity tab.** Who signed in, started, stopped, downloaded or changed
@@ -122,6 +123,50 @@ free):
 - LFM2.5 2.6B Q8 with 4 × 8k fits easily (about 3.9 GB).
 - Qwen3 8B Q4 with 2 × 4k fits (about 6.6 GB).
 - Bigger models need npc-rag to run one copy per card.
+
+## BFGguf: one model across both cards
+
+A node is either a **balancer** (one llama-server per card, the default) or
+a **BFGguf** (one llama-server spanning every card, for a model too big for
+one). The BFGguf runs `--device ROCm0,ROCm1 -sm layer -ts 1,1` (whole layers
+split evenly) on the first card's port, with the same health checks, crash
+restarts, metrics and log (`logs/bfgguf.log`) as a card.
+
+- **Switching.** The **Role** switch at the top of the Cards tab, or
+  `POST /v1/balancer/role` with the API key (below). The running set stops
+  and its processes exit (VRAM freed) before the other set starts; the
+  cards' own models come back when you switch back. New requests get 503
+  "switching role" meanwhile. The role survives restarts and reboots;
+  `BALANCER_ROLE` in `.env` only sets it on a node that has never saved one.
+- **Refused (409)** when the BFGguf model isn't downloaded, or when its
+  estimate doesn't fit the free VRAM of all cards added up, less
+  `VRAM_MARGIN_MB` per card. "Switch anyway" (`"anyway": true`) skips the
+  VRAM check.
+- **While a BFGguf**, the card Start/Stop buttons and routes answer 409
+  ("This is a BFGguf node right now."). Change its model, context or slots
+  in its panel (or `POST /api/bfgguf`); that restarts only the BFGguf.
+- **Routing.** A BFGguf node serves only requests that name its model (id,
+  name or file name). `"local"` gets 404 "This is a BFGguf node; it only
+  serves …", so Mnemerynne sends it elsewhere.
+- **The model.** `qwen3.6-35b-a3b`: `unsloth/Qwen3.6-35B-A3B-GGUF`,
+  `Qwen3.6-35B-A3B-UD-IQ3_S.gguf`, 13.7 GB. Qwen doesn't publish its own
+  GGUF of it. With npc-rag's copies holding about 8 GB per card, the two
+  cards have about 15 GB free together, so this quant (2 slots × 8k) just
+  fits; the Q3_K_S/Q3_K_M quants (15–17 GB) don't. It's a mixture of experts
+  (about 3B active per token) with hybrid attention: only 10 of its 40 layers
+  keep a KV cache, so context is cheap (about 20 MiB per 1,000 tokens).
+  Download it from the Models tab or `python -m mnemerynne_balancer download
+  qwen3.6-35b-a3b`. Catalog entries marked `"bfgguf": true` only appear in
+  the BFGguf picker.
+- **llama.cpp build.** The architecture is `qwen35moe` (Qwen3.5/3.6 MoE with
+  Gated DeltaNet layers). npc-rag's HIP build must be new enough to know it;
+  an older build fails to load the model ("unknown model architecture") and
+  the log says so. Rebuild with `npc-rag/linux/build-llama.sh`. Flash
+  attention stays off (`-fa off`), as for Qwen3 on the RX 6800s.
+- **Sharded models.** GGUFs split as `name-00001-of-00003.gguf` are one
+  model: listed once with the total size, every shard downloaded (resumed and
+  SHA-256-checked one by one) and deleted together, and llama-server is given
+  the first shard.
 
 ## The API
 
@@ -136,15 +181,24 @@ curl http://<node>:9180/v1/chat/completions \
   straight through.
 - **Choosing the model:** `model` is a model id from the Models tab. The
   display name or file name also work. While only one model is running, any
-  name works (Mnemerynne sends `"local"`).
+  name works (Mnemerynne sends `"local"`), except on a BFGguf node.
 - **Two cards, same model:** the card with fewer requests in flight per
   slot answers, and the response header `X-Balancer-Card` says which one.
 - **A card that doesn't answer:** the request is retried once on the other
   card.
-- **`GET /v1/balancer/load`:** this node's load for each model:
-  `{"id", "ready", "in_flight", "slots", "cards"}`. Mnemerynne will use it to
-  pick between several balancer nodes. Each balancer only knows its own
-  cards.
+- **`GET /v1/balancer/load`:** this node's role and its load for each
+  model. Mnemerynne uses it to pick between several balancer nodes. Each
+  balancer only knows its own cards.
+  ```json
+  {"node": "npc-rag", "role": "balancer", "switching": false,
+   "models": [{"id": "lfm2.5-2.6b-q8", "ready": true, "in_flight": 1, "slots": 8, "cards": [0, 1]}]}
+  ```
+  `role` is `"balancer"` or `"bfgguf"`; `switching` is true while a switch
+  is under way. On a BFGguf node the one model lists every card in `cards`.
+- **`POST /v1/balancer/role`:** `{"role": "bfgguf" | "balancer", "anyway":
+  false}` with the API key. Answers with the load JSON above after the
+  switch (the BFGguf is then still `"ready": false` while it loads), or 409
+  / 422 with `{"detail": "..."}`. Switches are in the Activity tab.
 - **Auth:** every `/v1` route needs the API key. Until one is set, `/v1`
   answers 503.
 
@@ -158,7 +212,8 @@ curl http://<node>:9180/v1/chat/completions \
 | `HF_TOKEN` | empty | only for gated repos; the page can set it |
 | `LLAMA_SERVER` | `/opt/llama.cpp/hip/bin/llama-server` | npc-rag's HIP build |
 | `CARD_PORTS` | `9181,9182` | one local port per card, in ROCm order |
-| `VRAM_MARGIN_MB` | `512` | kept free on top of the estimate |
+| `VRAM_MARGIN_MB` | `512` | kept free on top of the estimate (per card) |
+| `BALANCER_ROLE` | `balancer` | `balancer` or `bfgguf`; only for a node with no saved state yet |
 | `BALANCER_DATA_DIR` | `/var/lib/mnemerynne-balancer` | models, logs, state, audit log |
 
 After changing `.env`: `sudo systemctl restart mnemerynne-balancer`. That
@@ -172,7 +227,8 @@ tail -f /var/lib/mnemerynne-balancer/logs/card0.log            # card 0's llama-
 cd /opt/mnemerynne-balancer && sudo git pull && sudo linux/install.sh   # update
 ```
 
-`data/state.json` holds what each card runs. `data/secrets.json` holds
+`data/state.json` holds the role, what each card runs and the BFGguf's
+settings. `data/secrets.json` holds
 keys replaced from the page; it's owner-only. `data/audit.jsonl` is the
 activity log.
 

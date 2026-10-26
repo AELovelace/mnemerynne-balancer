@@ -63,13 +63,15 @@ if ! grep -qE '^BALANCER_API_KEY=.{16,}' "$ENV"; then
   grep -q '^BALANCER_API_KEY=' "$ENV" || echo "BALANCER_API_KEY=$NEW_KEY" >> "$ENV"
 fi
 grep -q '^BALANCER_DATA_DIR=' "$ENV" || echo "BALANCER_DATA_DIR=$DATA_DIR" >> "$ENV"
+# balancer (one llama-server per card) or bfgguf (one across all cards). Only used until the node saves a role.
+grep -q '^BALANCER_ROLE=' "$ENV" || echo "BALANCER_ROLE=${BALANCER_ROLE:-balancer}" >> "$ENV"
 chown root:"$SERVICE_USER" "$ENV"
 chmod 640 "$ENV"
 
-# 6. Disk: models are 1-9 GB each.
+# 6. Disk: card models are 1-9 GB each; a BFGguf model (one across both cards) is 14-20 GB.
 FREE_GB=$(df -BG --output=avail "$DATA_DIR" | tail -n1 | tr -dc '0-9')
-if (( FREE_GB < 15 )); then
-  echo "!! Only ${FREE_GB} GB free under $DATA_DIR; a couple of models need 5-15 GB."
+if (( FREE_GB < 40 )); then
+  echo "!! Only ${FREE_GB} GB free under $DATA_DIR; a couple of card models need 5-15 GB, and a BFGguf model up to 20 GB more."
 fi
 
 # 7. The unit (paths rewritten if the checkout isn't /opt/mnemerynne-balancer).

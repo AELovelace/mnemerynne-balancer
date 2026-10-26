@@ -38,6 +38,7 @@ class Settings:
     card_ports: tuple[int, ...]
     vram_margin_mb: int
     instance_host: str = "127.0.0.1"  # The cards' llama-servers are never reachable from the LAN.
+    role: str = "balancer"  # balancer (one llama-server per card) | bfgguf (one across all cards). Only until state.json says.
 
     @property
     def models_dir(self) -> Path:
@@ -74,6 +75,9 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
     if len(ports) < 1 or len(set(ports)) != len(ports):
         raise ValueError("CARD_PORTS must list one distinct port per card, e.g. 9181,9182")
     data = _env("BALANCER_DATA_DIR")
+    role = _env("BALANCER_ROLE", "balancer").lower() or "balancer"
+    if role not in ("balancer", "bfgguf"):
+        raise ValueError("BALANCER_ROLE must be balancer or bfgguf")
     return Settings(
         host=_env("BALANCER_HOST", "0.0.0.0"),
         port=int(_env("BALANCER_PORT", "9180")),
@@ -84,6 +88,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         hf_token=_env("HF_TOKEN"),
         card_ports=ports,
         vram_margin_mb=int(_env("VRAM_MARGIN_MB", "512")),
+        role=role,
     )
 
 
