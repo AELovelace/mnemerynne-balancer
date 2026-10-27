@@ -74,6 +74,18 @@ closes when the balancer exits, so a crash never leaves one holding VRAM.
    ("Run whether user is logged on or not"), and open the port:
    `New-NetFirewallRule -DisplayName "mnemerynne-balancer" -Direction Inbound -Protocol TCP -LocalPort 9180 -RemoteAddress LocalSubnet -Action Allow`.
 
+**Quick start for development:** `.\windows\start.ps1` from the checkout does
+steps 2–4 in one go:
+- runs `uv sync`;
+- on the first run, makes `.env` with Windows values (llama-server at
+  `C:\llama.cpp\llama-server.exe`, data in `.\data`) and a new password and
+  API key, printed once;
+- checks that llama-server is there;
+- serves in that window, where Ctrl+C stops it and its llama-servers.
+
+Options: `-Devices` lists the cards, `-LlamaServer <path>` points at another
+llama-server.exe, and `-NoSync` skips `uv sync`.
+
 On Windows, stopping a card ends its llama-server at once, not after its
 current request; there is no SIGTERM.
 
