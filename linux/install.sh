@@ -3,7 +3,8 @@
 # apt and ufw). Run from the checkout as root:
 #   sudo git clone https://github.com/AELovelace/mnemerynne-balancer.git /opt/mnemerynne-balancer
 #   sudo /opt/mnemerynne-balancer/linux/install.sh
-# Uses npc-rag's llama.cpp HIP build (/opt/llama.cpp/hip, from npc-rag/linux/build-llama.sh) and its uv (/opt/uv).
+# Uses llama.cpp's HIP build (/opt/llama.cpp/hip) or CUDA build (/opt/llama.cpp/cuda) from linux/build-llama.sh
+# (npc-rag's own build-llama.sh makes the same HIP build), and npc-rag's uv (/opt/uv, made here if it's missing).
 # Safe to run again: an existing .env keeps its values; only missing ones are filled in.
 set -euo pipefail
 
@@ -29,11 +30,14 @@ else
   apt-get install -y -qq git python3 python3-venv ufw curl
 fi
 
-# 2. llama-server: npc-rag's HIP build.
+# 2. llama-server: the HIP build (AMD), or the CUDA build (NVIDIA) when there's no HIP one. Both from build-llama.sh.
 LLAMA=$(grep -E '^LLAMA_SERVER=' "$ROOT/.env" 2>/dev/null | tail -n1 | cut -d= -f2- || true)
 LLAMA="${LLAMA:-/opt/llama.cpp/hip/bin/llama-server}"
+if [[ ! -x "$LLAMA" && "$LLAMA" == /opt/llama.cpp/hip/bin/llama-server && -x /opt/llama.cpp/cuda/bin/llama-server ]]; then
+  LLAMA=/opt/llama.cpp/cuda/bin/llama-server
+fi
 if [[ ! -x "$LLAMA" ]]; then
-  echo "!! $LLAMA is missing. Build it with npc-rag's script first:  sudo /opt/npc-rag/linux/build-llama.sh"
+  echo "!! $LLAMA is missing. Build it first:  sudo $ROOT/linux/build-llama.sh"
   echo "   (or set LLAMA_SERVER in $ROOT/.env to another llama-server), then run this again."
   exit 1
 fi
@@ -69,6 +73,8 @@ if ! grep -qE '^BALANCER_API_KEY=.{16,}' "$ENV"; then
   sed -i "s|^BALANCER_API_KEY=.*|BALANCER_API_KEY=$NEW_KEY|" "$ENV"
   grep -q '^BALANCER_API_KEY=' "$ENV" || echo "BALANCER_API_KEY=$NEW_KEY" >> "$ENV"
 fi
+sed -i "s|^LLAMA_SERVER=.*|LLAMA_SERVER=$LLAMA|" "$ENV"     # The one found in step 2 (unchanged unless that was CUDA).
+grep -q '^LLAMA_SERVER=' "$ENV" || echo "LLAMA_SERVER=$LLAMA" >> "$ENV"
 grep -q '^BALANCER_DATA_DIR=' "$ENV" || echo "BALANCER_DATA_DIR=$DATA_DIR" >> "$ENV"
 # balancer (one llama-server per card) or bfgguf (one across all cards). Only used until the node saves a role.
 grep -q '^BALANCER_ROLE=' "$ENV" || echo "BALANCER_ROLE=${BALANCER_ROLE:-balancer}" >> "$ENV"
