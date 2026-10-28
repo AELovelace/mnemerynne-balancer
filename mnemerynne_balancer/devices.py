@@ -11,7 +11,7 @@ DEVICE_LINE = re.compile(r"^\s*([A-Za-z]+\d+)\s*:\s*(.+?)\s*\((\d+)\s*MiB")  # "
 SYSFS = Path("/sys/class/drm")
 AMD_VENDOR = "0x1002"
 NVIDIA_QUERY = "pci.bus_id,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw"
-PREFIXES = {"rocm": "ROCm", "cuda": "CUDA"}  # llama-server's device names for each backend; auto takes any GPU.
+PREFIXES = {"rocm": "ROCm", "cuda": "CUDA", "vulkan": "Vulkan"}  # llama-server's device names; auto takes any GPU.
 
 
 def child_env() -> dict:
@@ -33,6 +33,10 @@ def probe_devices(server: str, runner=subprocess.run, backend: str = "auto") -> 
         m = DEVICE_LINE.match(line)
         if m and not m.group(1).upper().startswith("CPU") and m.group(1).startswith(PREFIXES.get(backend, "")):
             devices.append({"name": m.group(1), "description": m.group(2), "mib": int(m.group(3))})
+    if backend == "vulkan" and any("NVIDIA" in d["description"] for d in devices):
+        # Vulkan also lists an AMD integrated GPU (and maybe llvmpipe): on an NVIDIA box only NVIDIA cards are cards.
+        # They keep their own names (Vulkan1, Vulkan2), which is what --device wants.
+        devices = [d for d in devices if "NVIDIA" in d["description"]]
     return devices, text.strip()
 
 
@@ -124,7 +128,10 @@ def card_readings() -> list[dict]:
 
 
 def readings_for(backend: str) -> list[dict]:
-    """sysfs for rocm, nvidia-smi for cuda, card_readings for auto (which an AMD integrated GPU can fool)."""
+    """sysfs for rocm, nvidia-smi for cuda, NVIDIA first for vulkan (as probe_devices keeps only NVIDIA cards when
+    there are any), card_readings for auto (which an AMD integrated GPU can fool)."""
+    if backend == "vulkan":
+        return nvidia_readings() or gpu_readings()
     return {"rocm": gpu_readings, "cuda": nvidia_readings}.get(backend, card_readings)()
 
 

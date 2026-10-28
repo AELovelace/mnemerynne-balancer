@@ -82,6 +82,7 @@ pre { background:var(--bar); padding:10px; border-radius:8px; overflow:auto; max
       Applying restarts the running llama-servers with the same models.</p>
       <div class="row"><select id="backend">
         <option value="auto">Auto</option><option value="rocm">ROCm (AMD)</option><option value="cuda">CUDA (NVIDIA)</option>
+        <option value="vulkan">Vulkan (NVIDIA or AMD, no SDK)</option>
       </select><button class="act" id="save-backend">Apply</button></div>
       <p class="small muted">llama-server: <code id="backend-path"></code></p>
     </div>

@@ -30,11 +30,13 @@ else
   apt-get install -y -qq git python3 python3-venv ufw curl
 fi
 
-# 2. llama-server: the HIP build (AMD), or the CUDA build (NVIDIA) when there's no HIP one. Both from build-llama.sh.
+# 2. llama-server: the HIP build (AMD), else the CUDA (NVIDIA) or Vulkan one. All from build-llama.sh.
 LLAMA=$(grep -E '^LLAMA_SERVER=' "$ROOT/.env" 2>/dev/null | tail -n1 | cut -d= -f2- || true)
 LLAMA="${LLAMA:-/opt/llama.cpp/hip/bin/llama-server}"
-if [[ ! -x "$LLAMA" && "$LLAMA" == /opt/llama.cpp/hip/bin/llama-server && -x /opt/llama.cpp/cuda/bin/llama-server ]]; then
-  LLAMA=/opt/llama.cpp/cuda/bin/llama-server
+if [[ ! -x "$LLAMA" && "$LLAMA" == /opt/llama.cpp/hip/bin/llama-server ]]; then
+  for other in cuda vulkan; do   # No HIP build: the CUDA one, else the Vulkan one.
+    [[ -x /opt/llama.cpp/$other/bin/llama-server ]] && { LLAMA=/opt/llama.cpp/$other/bin/llama-server; break; }
+  done
 fi
 if [[ ! -x "$LLAMA" ]]; then
   echo "!! $LLAMA is missing. Build it first:  sudo $ROOT/linux/build-llama.sh"

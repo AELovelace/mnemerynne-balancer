@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from mnemerynne_balancer import devices as dev
 from mnemerynne_balancer import proxy
-from mnemerynne_balancer.config import BACKENDS, Secrets, Settings, server_for
+from mnemerynne_balancer.config import BACKENDS, BUILDS, Secrets, Settings, server_for
 from mnemerynne_balancer.downloads import Downloader, DownloadError, repo_files
 from mnemerynne_balancer.instances import BFGGUF_NODE, ROLES, Fleet, RoleRefused, saved_backend
 from mnemerynne_balancer.models import Models, shard_names
@@ -376,15 +376,21 @@ def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, re
         if backend is not None and backend != fleet.backend:
             # First, so a refusal changes nothing. Probed before switching: a missing build must not stop the cards.
             if backend not in BACKENDS:
-                raise HTTPException(400, 'The backend must be "auto", "rocm" or "cuda".')
+                raise HTTPException(400, 'The backend must be "auto", "rocm", "cuda" or "vulkan".')
             server = server_for(s, backend)
             found, raw = await asyncio.to_thread(probe, server, backend=backend)
             if not found:
+                name = dev.PREFIXES.get(backend, "GPU")
+                env = "LLAMA_SERVER" if backend == "auto" else f"LLAMA_SERVER_{backend.upper()}"
+                if backend != "auto" and server == s.llama_server and not getattr(s, env.lower()):
+                    # server_for found no build of its own and fell back to LLAMA_SERVER: say that, not its output.
+                    build = "hip" if backend == "rocm" else backend
+                    raise HTTPException(409, f"There's no {name} build: {BUILDS[backend]} isn't there and {env} isn't "
+                                             f"set, and LLAMA_SERVER ({server}) lists no {name} devices. Nothing changed. "
+                                             f"Build one with: sudo BACKEND={build} linux/build-llama.sh")
                 tail = "\n".join(raw.splitlines()[-15:])
-                raise HTTPException(409, f"{server} lists no {dev.PREFIXES.get(backend, 'GPU')} devices, so nothing "
-                                         f"changed. Build it with linux/build-llama.sh (BACKEND=hip or cuda), or set "
-                                         f"{'LLAMA_SERVER' if backend == 'auto' else 'LLAMA_SERVER_' + backend.upper()}"
-                                         f" in .env.\n{tail}")
+                raise HTTPException(409, f"{server} lists no {name} devices, so nothing changed. Check the build, "
+                                         f"or set {env} in .env.\n{tail}")
             try:
                 await fleet.set_backend(backend, server, found)
             except ValueError as error:

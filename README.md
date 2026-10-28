@@ -39,9 +39,16 @@ NVIDIA box can also have an AMD integrated GPU):
   Fedora doesn't package nvcc, so install it from NVIDIA's CUDA repo first;
   if nvcc rejects Fedora's gcc, run with `CUDAHOSTCXX` set to an older g++.
   Maxwell cards need CUDA 12.
+- **Vulkan (only with `BACKEND=vulkan`):** into `/opt/llama.cpp/vulkan`,
+  for either kind of card. It needs no GPU SDK, only the card's driver and
+  the Vulkan headers and `glslc` from the distro's own packages. Use it
+  where CUDA is more trouble than it's worth, such as Maxwell cards on
+  Fedora 44: CUDA 12 doesn't accept its gcc 16. On NVIDIA it needs NVIDIA's
+  own driver, and for Maxwell that's the 580 branch (RPM Fusion's
+  `akmod-nvidia-580xx`). Generation is usually somewhat slower than CUDA.
 
-`BACKEND=hip` or `BACKEND=cuda` overrides the choice. `install.sh` uses the
-HIP build, or the CUDA one when there's no HIP build, and writes it to
+`BACKEND=hip`, `cuda` or `vulkan` overrides the choice. `install.sh` uses the
+HIP build, else the CUDA one, else the Vulkan one, and writes it to
 `LLAMA_SERVER` in `.env`. If the balancer ends up on the wrong one, pick it
 in the Settings tab's **Backend** dropdown (below).
 
@@ -144,10 +151,12 @@ Open `http://<node>:9180/` and sign in with the password.
   same role (see BFGguf below).
 - **Settings tab.** Replace the API key (there's a **Generate** button) or
   set a Hugging Face token for gated repos. Both are write-only.
-  - **Backend:** Auto, ROCm (AMD) or CUDA (NVIDIA). It picks the
-    llama-server (`/opt/llama.cpp/hip` or `/opt/llama.cpp/cuda`, or
-    `LLAMA_SERVER_ROCM`/`_CUDA`), where VRAM and temperature come from
-    (sysfs or `nvidia-smi`), and which devices count as cards. Auto uses
+  - **Backend:** Auto, ROCm (AMD), CUDA (NVIDIA) or Vulkan. It picks the
+    llama-server (`/opt/llama.cpp/hip`, `cuda` or `vulkan`, or
+    `LLAMA_SERVER_ROCM`/`_CUDA`/`_VULKAN`), where VRAM and temperature come
+    from (sysfs or `nvidia-smi`), and which devices count as cards. Vulkan
+    also lists integrated GPUs, so when it sees NVIDIA cards it keeps only
+    those and reads them from `nvidia-smi`. Auto uses
     `LLAMA_SERVER` and reads AMD cards first, which an AMD integrated GPU
     fools on an NVIDIA box. **Apply** checks that the build lists that
     backend's devices (or says why not and changes nothing), then restarts
@@ -252,8 +261,8 @@ curl http://<node>:9180/v1/chat/completions \
 | `CARD_PORTS` | `9181,9182` | one local port per card, in ROCm order |
 | `VRAM_MARGIN_MB` | `512` | kept free on top of the estimate (per card) |
 | `BALANCER_ROLE` | `balancer` | `balancer` or `bfgguf`; only for a node with no saved state yet |
-| `BALANCER_BACKEND` | `auto` | `auto`, `rocm` or `cuda`; only until the Settings tab saves one |
-| `LLAMA_SERVER_ROCM`, `LLAMA_SERVER_CUDA` | empty | each backend's llama-server; empty: build-llama.sh's build if it's there, else `LLAMA_SERVER` |
+| `BALANCER_BACKEND` | `auto` | `auto`, `rocm`, `cuda` or `vulkan`; only until the Settings tab saves one |
+| `LLAMA_SERVER_ROCM`, `_CUDA`, `_VULKAN` | empty | each backend's llama-server; empty: build-llama.sh's build if it's there, else `LLAMA_SERVER` |
 | `BALANCER_DATA_DIR` | `/var/lib/mnemerynne-balancer` | models, logs, state, audit log |
 
 After changing `.env`: `sudo systemctl restart mnemerynne-balancer`. That

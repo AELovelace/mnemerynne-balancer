@@ -22,7 +22,7 @@ from pathlib import Path
 import httpx
 
 from mnemerynne_balancer.config import BACKENDS, Settings
-from mnemerynne_balancer.devices import child_env
+from mnemerynne_balancer.devices import PREFIXES, child_env
 from mnemerynne_balancer.models import Models, chat_template_path, estimate_mib
 
 LOG = logging.getLogger("balancer.instances")
@@ -182,7 +182,7 @@ class Fleet:
 
     def _set_devices(self, devices: list[dict]) -> None:
         """Each card gets llama-server's device in order (ROCm0, CUDA1, ...); the BFGguf gets all of them."""
-        prefix = "CUDA" if self.backend == "cuda" else "ROCm"
+        prefix = PREFIXES.get(self.backend, "ROCm")
         for card in self.cards:
             d = devices[card.index] if card.index < len(devices) else \
                 {"name": f"{prefix}{card.index}", "description": "not detected", "mib": 0}
@@ -476,7 +476,7 @@ class Fleet:
         """Stop the running set, take the backend's llama-server and its devices (the caller probed `devices` with
         `server`), and start the same set again on them."""
         if backend not in BACKENDS:
-            raise ValueError('The backend must be "auto", "rocm" or "cuda".')
+            raise ValueError('The backend must be "auto", "rocm", "cuda" or "vulkan".')
         async with self._all_locks():
             if self.closing:
                 raise ValueError("The balancer is shutting down.")

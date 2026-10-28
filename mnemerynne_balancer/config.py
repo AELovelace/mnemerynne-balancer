@@ -8,8 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent  # The checkout: .env and (by default) data/ live here.
-BACKENDS = ("auto", "rocm", "cuda")  # auto: LLAMA_SERVER as it is, AMD readings first; rocm: AMD cards; cuda: NVIDIA cards.
-BUILDS = {"rocm": "/opt/llama.cpp/hip/bin/llama-server", "cuda": "/opt/llama.cpp/cuda/bin/llama-server"}  # build-llama.sh's.
+# auto: LLAMA_SERVER as it is, AMD readings first; rocm: AMD cards; cuda: NVIDIA cards; vulkan: either, no SDK needed.
+BACKENDS = ("auto", "rocm", "cuda", "vulkan")
+BUILDS = {"rocm": "/opt/llama.cpp/hip/bin/llama-server", "cuda": "/opt/llama.cpp/cuda/bin/llama-server",
+          "vulkan": "/opt/llama.cpp/vulkan/bin/llama-server"}  # build-llama.sh's.
 
 
 def _load_dotenv(path: Path) -> None:
@@ -44,6 +46,7 @@ class Settings:
     backend: str = "auto"   # One of BACKENDS. Only until the page saves one in state.json.
     llama_server_rocm: str = ""  # The llama-server for each backend when it isn't build-llama.sh's (see server_for).
     llama_server_cuda: str = ""
+    llama_server_vulkan: str = ""
 
     @property
     def models_dir(self) -> Path:
@@ -85,7 +88,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         raise ValueError("BALANCER_ROLE must be balancer or bfgguf")
     backend = _env("BALANCER_BACKEND", "auto").lower() or "auto"
     if backend not in BACKENDS:
-        raise ValueError("BALANCER_BACKEND must be auto, rocm or cuda")
+        raise ValueError("BALANCER_BACKEND must be auto, rocm, cuda or vulkan")
     return Settings(
         host=_env("BALANCER_HOST", "0.0.0.0"),
         port=int(_env("BALANCER_PORT", "9180")),
@@ -100,15 +103,16 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         backend=backend,
         llama_server_rocm=_env("LLAMA_SERVER_ROCM"),
         llama_server_cuda=_env("LLAMA_SERVER_CUDA"),
+        llama_server_vulkan=_env("LLAMA_SERVER_VULKAN"),
     )
 
 
 def server_for(s: Settings, backend: str) -> str:
-    """The llama-server for a backend: LLAMA_SERVER_ROCM/_CUDA when set, else build-llama.sh's build when it's there,
-    else LLAMA_SERVER (on Windows, the one CUDA build)."""
+    """The llama-server for a backend: LLAMA_SERVER_ROCM/_CUDA/_VULKAN when set, else build-llama.sh's build when it's
+    there, else LLAMA_SERVER (on Windows, the one build in C:\\llama.cpp)."""
     if backend == "auto":
         return s.llama_server
-    explicit = s.llama_server_rocm if backend == "rocm" else s.llama_server_cuda
+    explicit = getattr(s, f"llama_server_{backend}")
     if explicit:
         return explicit
     return BUILDS[backend] if Path(BUILDS[backend]).is_file() else s.llama_server

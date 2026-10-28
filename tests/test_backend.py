@@ -28,9 +28,27 @@ def test_a_backend_keeps_only_its_own_devices():
     assert [d["name"] for d in dev.probe_devices("llama-server", runner=run, backend="rocm")[0]] == ["ROCm0"]
 
 
+VULKAN = """ggml_vulkan: Found 3 Vulkan devices:
+Available devices:
+  Vulkan0: AMD Radeon Graphics (RADV RAPHAEL_MENDOCINO) (2048 MiB, 1900 MiB free)
+  Vulkan1: NVIDIA GeForce GTX TITAN X (12288 MiB, 12000 MiB free)
+  Vulkan2: NVIDIA GeForce GTX TITAN X (12288 MiB, 12000 MiB free)
+"""
+
+
+def test_vulkan_on_an_nvidia_box_keeps_only_the_nvidia_cards_under_their_own_names():
+    run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, VULKAN, "")  # noqa: E731
+    found, _ = dev.probe_devices("llama-server", runner=run, backend="vulkan")
+    assert [d["name"] for d in found] == ["Vulkan1", "Vulkan2"]   # --device Vulkan1 is the first Titan X.
+    amd_only = VULKAN.replace("NVIDIA GeForce GTX TITAN X", "AMD Radeon RX 6800 XT (RADV NAVI21)")
+    run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, amd_only, "")  # noqa: E731
+    assert len(dev.probe_devices("llama-server", runner=run, backend="vulkan")[0]) == 3
+
+
 def test_server_for_prefers_the_env_then_the_build_then_llama_server(settings, tmp_path, monkeypatch):
     built = tmp_path / "cuda-llama-server"
-    monkeypatch.setattr(config, "BUILDS", {"rocm": str(tmp_path / "missing"), "cuda": str(built)})
+    monkeypatch.setattr(config, "BUILDS", {**dict.fromkeys(("rocm", "vulkan"), str(tmp_path / "missing")),
+                                           "cuda": str(built)})
     assert server_for(settings, "auto") == settings.llama_server
     assert server_for(settings, "cuda") == settings.llama_server     # No build yet.
     built.write_text("")
@@ -60,7 +78,7 @@ def signed_in(app):
 
 
 def test_switching_backend_restarts_the_cards_on_the_new_build(settings, tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "BUILDS", {"rocm": str(tmp_path / "missing"), "cuda": str(tmp_path / "missing")})
+    monkeypatch.setattr(config, "BUILDS", dict.fromkeys(("rocm", "cuda", "vulkan"), str(tmp_path / "missing")))
     settings = replace(settings, llama_server_cuda="/opt/llama.cpp/cuda/bin/llama-server")
     app, calls = make(settings, {"auto": DEVICES, "cuda": CUDA})
     c = signed_in(app)
@@ -91,10 +109,18 @@ def test_a_backend_with_no_devices_is_refused_and_nothing_changes(settings):
     app, _ = make(settings, {"auto": DEVICES})
     c = signed_in(app)
     assert c.post("/api/cards/0/start", json={"model": "lfm2.5-2.6b-q8"}, headers=HDR).status_code == 200
-    r = c.post("/api/settings", json={"backend": "cuda"}, headers=HDR)
-    assert r.status_code == 409 and "lists no CUDA devices" in r.json()["detail"]
+    r = c.post("/api/settings", json={"backend": "cuda"}, headers=HDR)   # No CUDA build: LLAMA_SERVER was tried.
+    assert r.status_code == 409 and "There's no CUDA build" in r.json()["detail"]
+    assert "BACKEND=cuda linux/build-llama.sh" in r.json()["detail"]
     assert app.state.fleet.backend == "auto" and app.state.fleet.popen.procs[0].returncode is None
-    assert c.post("/api/settings", json={"backend": "vulkan"}, headers=HDR).status_code == 400
+    assert c.post("/api/settings", json={"backend": "metal"}, headers=HDR).status_code == 400
+    c.__exit__(None, None, None)
+
+    app, _ = make(replace(settings, llama_server_cuda="/x/llama-server"), {"auto": DEVICES})
+    c = signed_in(app)
+    r = c.post("/api/settings", json={"backend": "cuda"}, headers=HDR)   # A CUDA build that sees no cards.
+    assert r.status_code == 409 and r.json()["detail"].startswith("/x/llama-server lists no CUDA devices")
+    assert "/x/llama-server: nothing for cuda" in r.json()["detail"]     # Its own output, to say why.
 
 
 def test_balancer_backend_env_counts_only_without_saved_state(settings):
@@ -112,3 +138,6 @@ def test_cuda_reads_nvidia_smi_even_with_an_amd_card(monkeypatch):
     assert dev.readings_for("auto") == [{"pci": "igpu"}]
     assert dev.readings_for("cuda") == [{"pci": "titan"}]
     assert dev.readings_for("rocm") == [{"pci": "igpu"}]
+    assert dev.readings_for("vulkan") == [{"pci": "titan"}]
+    monkeypatch.setattr(dev, "nvidia_readings", lambda: [])
+    assert dev.readings_for("vulkan") == [{"pci": "igpu"}]       # An AMD box on Vulkan.
