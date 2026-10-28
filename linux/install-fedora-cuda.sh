@@ -56,7 +56,24 @@ fi
 nvidia-smi -L | sed 's/^/   /'
 
 # 3. The pinned toolkit, and a gcc it accepts. nvcc 12.x stops at gcc 14; Fedora's default is newer.
-dnf install -y "$CUDA_PKG"
+# Each release's repo starts at the CUDA that was current then (fedora42 and later: 13.x), so an older toolkit
+# comes from an older release's repo. A toolkit already at $CUDA_HOME (NVIDIA's .run installer) is used as it is.
+if [[ ! -x "$CUDA_HOME/bin/nvcc" ]]; then
+  if ! dnf list --available "$CUDA_PKG" &>/dev/null; then
+    for v in 41 39; do
+      url="https://developer.download.nvidia.com/compute/cuda/repos/fedora$v/x86_64/cuda-fedora$v.repo"
+      [[ -f /etc/yum.repos.d/cuda-fedora$v.repo ]] || curl -fsI "$url" >/dev/null || continue
+      [[ -f /etc/yum.repos.d/cuda-fedora$v.repo ]] || dnf config-manager addrepo --from-repofile="$url" 2>/dev/null || dnf config-manager --add-repo "$url"
+      dnf list --available "$CUDA_PKG" &>/dev/null && { echo "== $CUDA_PKG comes from the fedora$v repo"; break; }
+    done
+  fi
+  dnf list --available "$CUDA_PKG" &>/dev/null || {
+    echo "!! No repo offers $CUDA_PKG. Available: $(dnf list --available 'cuda-toolkit-1*' 2>/dev/null | grep -oE '^cuda-toolkit-1[0-9]-[0-9]+' | sort -u | tr '\n' ' ')"
+    echo "   Pick one of those with CUDA_VERSION=, or install the toolkit with NVIDIA's .run file into $CUDA_HOME and run this again."
+    exit 1
+  }
+  dnf install -y "$CUDA_PKG"
+fi
 [[ -x "$CUDA_HOME/bin/nvcc" ]] || { echo "!! $CUDA_HOME/bin/nvcc is missing after installing $CUDA_PKG."; exit 1; }
 echo "$CUDA_HOME/lib64" > /etc/ld.so.conf.d/cuda-${CUDA_VERSION//./-}.conf && ldconfig
 export CC=gcc CXX=g++ CUDAFLAGS=""
