@@ -21,16 +21,27 @@ npc-rag keeps 9090–9093 and its copies count up from 9100.
 
 ## Install (Ubuntu 26.04 or Fedora, as root)
 
-npc-rag's llama.cpp build must be there first (`/opt/llama.cpp/hip`, from
-`npc-rag/linux/build-llama.sh`). On a Fedora box without npc-rag, build
-llama.cpp with HIP yourself, copy `.env.example` to `.env` and set
-`LLAMA_SERVER` to its `llama-server` before running `install.sh`; the
-script stops if it isn't there.
-
 ```bash
 git clone https://github.com/AELovelace/mnemerynne-balancer.git /opt/mnemerynne-balancer
+/opt/mnemerynne-balancer/linux/build-llama.sh      # skip on an npc-rag node: its build is already there
 /opt/mnemerynne-balancer/linux/install.sh          # ALLOW_FROM=172.27.0.0/16 to limit 9180 to the LAN
 ```
+
+`build-llama.sh` builds llama-server from the same llama.cpp tag as
+npc-rag's script. It looks at the cards to pick the backend:
+
+- **AMD:** ROCm HIP into `/opt/llama.cpp/hip`, with ROCm from the distro's
+  own packages. Set `GPU_TARGETS` if your cards aren't gfx1030
+  (`rocminfo | grep gfx`).
+- **NVIDIA:** CUDA into `/opt/llama.cpp/cuda`, built for the cards in the
+  machine (or `CUDA_ARCHS`). Ubuntu gets nvcc from `nvidia-cuda-toolkit`.
+  Fedora doesn't package nvcc, so install it from NVIDIA's CUDA repo first;
+  if nvcc rejects Fedora's gcc, run with `CUDAHOSTCXX` set to an older g++.
+  Maxwell cards need CUDA 12.
+
+`BACKEND=hip` or `BACKEND=cuda` overrides the choice. `install.sh` uses the
+HIP build, or the CUDA one when there's no HIP build, and writes it to
+`LLAMA_SERVER` in `.env`.
 
 `install.sh` does the following, and is safe to run again (an existing
 `.env` keeps its values):
@@ -177,7 +188,7 @@ restarts, metrics and log (`logs/bfgguf.log`) as a card.
 - **llama.cpp build.** The architecture is `qwen35moe` (Qwen3.5/3.6 MoE with
   Gated DeltaNet layers). npc-rag's HIP build must be new enough to know it;
   an older build fails to load the model ("unknown model architecture") and
-  the log says so. Rebuild with `npc-rag/linux/build-llama.sh`. Flash
+  the log says so. Rebuild with `linux/build-llama.sh` (or npc-rag's). Flash
   attention stays off (`-fa off`), as for Qwen3 on the RX 6800s.
 - **Sharded models.** GGUFs split as `name-00001-of-00003.gguf` are one
   model: listed once with the total size, every shard downloaded (resumed and
