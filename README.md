@@ -113,6 +113,44 @@ llama-server.exe, and `-NoSync` skips `uv sync`.
 On Windows, stopping a card ends its llama-server at once, not after its
 current request; there is no SIGTERM.
 
+## Fedora with NVIDIA cards and an older CUDA (as root)
+
+`install-fedora-cuda.sh` wraps the two scripts above for a Fedora rig
+whose cards want a **pinned, older CUDA** (Maxwell: CUDA 12 and driver 580)
+and must not fall back to Vulkan (it contended for CPU cores with this
+model). It adds RPM Fusion and NVIDIA's Fedora CUDA repo, installs the
+driver if `nvidia-smi` is missing, installs `cuda-toolkit-12-8` and the
+`gcc14` compat package nvcc 12 accepts, builds `/opt/llama.cpp/cuda` with
+`build-llama.sh`, seeds `.env` with `BALANCER_BACKEND=cuda`, and runs
+`install.sh`.
+
+```bash
+sudo git clone https://github.com/AELovelace/mnemerynne-balancer.git /opt/mnemerynne-balancer
+sudo CUDA_VERSION=12.8 ALLOW_FROM=172.27.0.0/16 /opt/mnemerynne-balancer/linux/install-fedora-cuda.sh
+```
+
+- `CUDA_VERSION` (default `12.8`) picks the `cuda-toolkit-12-8` package and
+  builds with its nvcc, whatever newer CUDA is also on the box.
+- `CUDA_ARCHS` (default `52;61;75;86`): 52 Maxwell (GTX 9xx, Titan X), 61
+  Pascal, 75 Turing, 86 Ampere; add `89` for Ada.
+- `NVIDIA_DRIVER`: `auto` installs RPM Fusion's `akmod-nvidia` only when
+  `nvidia-smi` is missing; `580xx` installs the legacy 580 branch (the last
+  for Maxwell); `skip` leaves the driver alone. After a fresh driver install
+  akmods still builds the module: `akmods --force && reboot`, then run the
+  script again.
+- `HOST_GCC` (default `14`) is the compat gcc nvcc builds with. If Fedora
+  has no such package the build goes ahead with
+  `-allow-unsupported-compiler`.
+- Re-running is safe: repos, driver and toolkit are left alone once there.
+- Flash attention works on CUDA, so a model added here doesn't need the
+  `-fa off` the RX 6800 entries carry.
+- **CPU contention:** every layer is on the card (`-ngl 999`), so
+  llama-server only needs a few host threads. If it still fights other
+  processes for cores, put `-t 2` in the card's "Extra args".
+
+Then continue at [Everyday use](#everyday-use): download a model, start the
+cards, and give Mnemerynne the node's URL and API key.
+
 ## Everyday use
 
 Open `http://<node>:9180/` and sign in with the password.
