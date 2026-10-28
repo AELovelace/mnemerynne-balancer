@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install or update mnemerynne-balancer on an Ubuntu 26.04 npc-rag node. Run from the checkout as root:
+# Install or update mnemerynne-balancer on an Ubuntu 26.04 npc-rag node, or on Fedora (dnf and firewalld instead of
+# apt and ufw). Run from the checkout as root:
 #   sudo git clone https://github.com/AELovelace/mnemerynne-balancer.git /opt/mnemerynne-balancer
 #   sudo /opt/mnemerynne-balancer/linux/install.sh
 # Uses npc-rag's llama.cpp HIP build (/opt/llama.cpp/hip, from npc-rag/linux/build-llama.sh) and its uv (/opt/uv).
@@ -17,10 +18,16 @@ ALLOW_FROM="${ALLOW_FROM:-}"                  # e.g. 172.27.0.0/16: only that ne
 [[ $EUID -eq 0 ]] || { echo "Run as root (sudo $0)"; exit 1; }
 echo "mnemerynne-balancer checkout: $ROOT"
 
-# 1. Packages.
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq git python3 python3-venv ufw curl
+# 1. Packages. Fedora's python3 already has venv; firewalld stands in for ufw.
+if command -v dnf &>/dev/null; then
+  FIREWALL=firewalld
+  dnf install -y -q git python3 firewalld curl
+else
+  FIREWALL=ufw
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq git python3 python3-venv ufw curl
+fi
 
 # 2. llama-server: npc-rag's HIP build.
 LLAMA=$(grep -E '^LLAMA_SERVER=' "$ROOT/.env" 2>/dev/null | tail -n1 | cut -d= -f2- || true)
@@ -83,12 +90,28 @@ systemctl enable mnemerynne-balancer.service
 systemctl restart mnemerynne-balancer.service
 
 # 8. Firewall: 9180 only; the cards' own ports (9181/9182) stay on 127.0.0.1.
-if [[ -n "$ALLOW_FROM" ]]; then
-  ufw allow from "$ALLOW_FROM" to any port "$PORT" proto tcp comment mnemerynne-balancer
+if [[ $FIREWALL == firewalld ]]; then
+  # The default zone; firewall-offline-cmd edits the saved config while firewalld is stopped.
+  if firewall-cmd --state &>/dev/null; then FWCMD=(firewall-cmd --permanent); else FWCMD=(firewall-offline-cmd); fi
+  if [[ -n "$ALLOW_FROM" ]]; then
+    [[ $ALLOW_FROM == *:* ]] && FAMILY=ipv6 || FAMILY=ipv4
+    "${FWCMD[@]}" --add-rich-rule="rule family=$FAMILY source address=$ALLOW_FROM port port=$PORT protocol=tcp accept"
+  else
+    "${FWCMD[@]}" --add-port="$PORT"/tcp
+  fi
+  if firewall-cmd --state &>/dev/null; then
+    firewall-cmd --reload
+  else
+    echo "firewalld is off. To turn it on (ssh stays allowed in Fedora's default zones): systemctl enable --now firewalld"
+  fi
 else
-  ufw allow "$PORT"/tcp comment mnemerynne-balancer
+  if [[ -n "$ALLOW_FROM" ]]; then
+    ufw allow from "$ALLOW_FROM" to any port "$PORT" proto tcp comment mnemerynne-balancer
+  else
+    ufw allow "$PORT"/tcp comment mnemerynne-balancer
+  fi
+  ufw status | grep -q "Status: active" || echo "ufw is off. To turn it on without locking yourself out: ufw allow OpenSSH && ufw enable"
 fi
-ufw status | grep -q "Status: active" || echo "ufw is off. To turn it on without locking yourself out: ufw allow OpenSSH && ufw enable"
 
 echo
 echo "== mnemerynne-balancer is running: http://$(hostname -f 2>/dev/null || hostname):$PORT/"

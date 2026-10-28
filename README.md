@@ -14,15 +14,18 @@ llama.cpp build. The plan and the reasons behind it are in
 
 | Port | What | Reachable from |
 |---|---|---|
-| 9180 | control page (`/`) and the OpenAI-compatible API (`/v1`) | the LAN (ufw) |
+| 9180 | control page (`/`) and the OpenAI-compatible API (`/v1`) | the LAN (ufw or firewalld) |
 | 9181, 9182 | the llama-server on card 0 and card 1 | this machine only |
 
 npc-rag keeps 9090–9093 and its copies count up from 9100.
 
-## Install (Ubuntu 26.04, as root)
+## Install (Ubuntu 26.04 or Fedora, as root)
 
 npc-rag's llama.cpp build must be there first (`/opt/llama.cpp/hip`, from
-`npc-rag/linux/build-llama.sh`).
+`npc-rag/linux/build-llama.sh`). On a Fedora box without npc-rag, build
+llama.cpp with HIP yourself, copy `.env.example` to `.env` and set
+`LLAMA_SERVER` to its `llama-server` before running `install.sh`; the
+script stops if it isn't there.
 
 ```bash
 git clone https://github.com/AELovelace/mnemerynne-balancer.git /opt/mnemerynne-balancer
@@ -38,7 +41,8 @@ git clone https://github.com/AELovelace/mnemerynne-balancer.git /opt/mnemerynne-
 3. fills in `.env`: a control page password and an API key, each printed
    once
 4. installs and starts `mnemerynne-balancer.service`
-5. opens 9180 in ufw
+5. opens 9180 in ufw, or on Fedora (found by `dnf`) in firewalld's default
+   zone, as a rich rule when `ALLOW_FROM` is set
 
 Check that it sees both cards:
 
