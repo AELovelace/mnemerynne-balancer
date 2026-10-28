@@ -16,7 +16,7 @@ set -euo pipefail
 
 PREFIX="${PREFIX:-/opt/llama.cpp}"      # Install root.
 LLAMA_TAG="${LLAMA_TAG:-b9481}"         # npc-rag's tested build; any llama.cpp tag or branch works.
-BACKEND="${BACKEND:-}"                  # hip or cuda; empty: AMD cards -> hip, else NVIDIA cards -> cuda.
+BACKEND="${BACKEND:-}"                  # hip or cuda; empty: NVIDIA cards -> cuda, else AMD cards -> hip.
 GPU_TARGETS="${GPU_TARGETS:-gfx1030}"   # RX 6800 / 6800 XT / 6900 XT.
 CUDA_ARCHS="${CUDA_ARCHS:-}"            # Empty: llama.cpp builds for the cards in this machine.
 ROCM_SOURCE="${ROCM_SOURCE:-archive}"   # archive = the distro's own ROCm packages; amd = leave /opt/rocm alone.
@@ -26,10 +26,11 @@ SRC="$PREFIX/src"
 [[ $EUID -eq 0 ]] || { echo "Run as root (sudo $0)"; exit 1; }
 
 if [[ -z "$BACKEND" ]]; then
-  if grep -qs 0x1002 /sys/class/drm/card[0-9]*/device/vendor; then
-    BACKEND=hip
-  elif nvidia-smi -L &>/dev/null; then
+  # NVIDIA first: an NVIDIA box can also have an AMD integrated GPU, but nobody installs NVIDIA's driver by accident.
+  if nvidia-smi -L &>/dev/null; then
     BACKEND=cuda
+  elif grep -qs 0x1002 /sys/class/drm/card[0-9]*/device/vendor; then
+    BACKEND=hip
   else
     BACKEND=hip
     echo "WARNING: no AMD card in sysfs and no working nvidia-smi; building HIP. Set BACKEND=cuda for NVIDIA."

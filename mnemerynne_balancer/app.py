@@ -13,6 +13,7 @@ import socket
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -21,9 +22,9 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from mnemerynne_balancer import devices as dev
 from mnemerynne_balancer import proxy
-from mnemerynne_balancer.config import Secrets, Settings
+from mnemerynne_balancer.config import BACKENDS, Secrets, Settings, server_for
 from mnemerynne_balancer.downloads import Downloader, DownloadError, repo_files
-from mnemerynne_balancer.instances import BFGGUF_NODE, ROLES, Fleet, RoleRefused
+from mnemerynne_balancer.instances import BFGGUF_NODE, ROLES, Fleet, RoleRefused, saved_backend
 from mnemerynne_balancer.models import Models, shard_names
 
 LOG = logging.getLogger("balancer.app")
@@ -34,19 +35,23 @@ SESSION_S = 12 * 3600
 FAILS, FAIL_WINDOW_S = 5, 300
 
 
-def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, readings=None,
+def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, readings=None, probe=None,
                instance_transport=None, proxy_transport=None, download_transport=None, watchdog: bool = True) -> FastAPI:
-    """devices/popen/readings/transports are for tests; normally they come from the machine."""
+    """devices/popen/readings/probe/transports are for tests; normally they come from the machine."""
     if len(s.admin_password) < 8:
         raise ValueError("ADMIN_PASSWORD must be set (8+ characters) before the control page can start")
+    probe = probe or dev.probe_devices
+    backend = saved_backend(s)
+    # s keeps LLAMA_SERVER as configured (server_for needs it); the fleet runs the backend's own.
+    running = replace(s, backend=backend, llama_server=server_for(s, backend))
     if devices is None:
-        devices, raw = dev.probe_devices(s.llama_server)
+        devices, raw = probe(running.llama_server, backend=backend)
         if not devices:
-            LOG.warning("llama-server listed no GPUs:\n%s", raw)
-    read_cards = readings or dev.card_readings
+            LOG.warning("%s listed no %s GPUs:\n%s", running.llama_server, backend, raw)
     secret_store = Secrets(s)
     models = Models(s.models_dir, s.custom_models_file)
-    fleet = Fleet(s, models, devices, **({"popen": popen} if popen else {}), transport=instance_transport)
+    fleet = Fleet(running, models, devices, **({"popen": popen} if popen else {}), transport=instance_transport)
+    read_cards = readings or (lambda: dev.readings_for(fleet.backend))
     downloader = Downloader(s.models_dir, lambda: secret_store.get("hf_token"), download_transport)
     v1 = proxy.router(fleet, lambda: secret_store.get("api_key"), proxy_transport)
 
@@ -202,7 +207,8 @@ def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, re
         disk = shutil.disk_usage(s.data_dir if s.data_dir.exists() else Path("."))
         return {"node": socket.gethostname(), "role": fleet.role, "switching": fleet.switching, "bfgguf": bfgguf,
                 "cards": cards, "models": listed, "secrets": secret_store.status(),
-                "disk_free_gb": round(disk.free / 2**30, 1), "llama_server": s.llama_server,
+                "disk_free_gb": round(disk.free / 2**30, 1), "llama_server": fleet.settings.llama_server,
+                "backend": fleet.backend, "backends": {b: server_for(s, b) for b in BACKENDS},
                 "port": s.port, "vram_margin_mb": s.vram_margin_mb}
 
     @app.post("/api/cards/{index}/start")
@@ -366,6 +372,24 @@ def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, re
         require(request, post=True)
         data = await body(request)
         changed = []
+        backend = data.get("backend")
+        if backend is not None and backend != fleet.backend:
+            # First, so a refusal changes nothing. Probed before switching: a missing build must not stop the cards.
+            if backend not in BACKENDS:
+                raise HTTPException(400, 'The backend must be "auto", "rocm" or "cuda".')
+            server = server_for(s, backend)
+            found, raw = await asyncio.to_thread(probe, server, backend=backend)
+            if not found:
+                tail = "\n".join(raw.splitlines()[-15:])
+                raise HTTPException(409, f"{server} lists no {dev.PREFIXES.get(backend, 'GPU')} devices, so nothing "
+                                         f"changed. Build it with linux/build-llama.sh (BACKEND=hip or cuda), or set "
+                                         f"{'LLAMA_SERVER' if backend == 'auto' else 'LLAMA_SERVER_' + backend.upper()}"
+                                         f" in .env.\n{tail}")
+            try:
+                await fleet.set_backend(backend, server, found)
+            except ValueError as error:
+                raise HTTPException(409, str(error)) from None
+            changed.append("backend")
         for name in Secrets.KEYS:
             if name in data and data[name] is not None:
                 value = str(data[name]).strip()
@@ -373,8 +397,9 @@ def create_app(s: Settings, *, devices: list[dict] | None = None, popen=None, re
                     raise HTTPException(400, "Use an API key of 16+ characters.")
                 secret_store.set(name, value)
                 changed.append(name)
-        audit(request, "settings", changed=changed)  # Names only, never values.
-        return {"ok": True, "secrets": secret_store.status()}
+        # Names only, never secret values; the backend isn't secret.
+        audit(request, "settings", changed=changed, **({"backend": fleet.backend} if "backend" in changed else {}))
+        return {"ok": True, "secrets": secret_store.status(), "backend": fleet.backend}
 
     @app.get("/api/audit")
     async def audit_log(request: Request, lines: int = 100):

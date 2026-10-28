@@ -7,16 +7,20 @@ import sys
 import time
 
 from mnemerynne_balancer import devices as dev
-from mnemerynne_balancer.config import Secrets, load_settings
+from mnemerynne_balancer.config import BACKENDS, Secrets, load_settings, server_for
 from mnemerynne_balancer.downloads import Downloader
+from mnemerynne_balancer.instances import saved_backend
 from mnemerynne_balancer.models import Models
 
 
-def _devices(s) -> int:
-    found, raw = dev.probe_devices(s.llama_server)
-    readings = dev.card_readings()
+def _devices(s, backend: str | None = None) -> int:
+    backend = backend or saved_backend(s)
+    server = server_for(s, backend)
+    print(f"backend {backend}: {server}")
+    found, raw = dev.probe_devices(server, backend=backend)
+    readings = dev.readings_for(backend)
     if not found:
-        print(f"{s.llama_server} listed no GPUs. Its output:\n{raw}")
+        print(f"{server} listed no {(dev.PREFIXES.get(backend, '') + ' ').lstrip()}GPUs. Its output:\n{raw}")
         return 1
     matched = dev.match_readings(found, readings)
     for i, d in enumerate(found):
@@ -64,7 +68,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--env-file", help=".env to read (default: the checkout's .env)")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="the control page and /v1 balancer")
-    sub.add_parser("devices", help="the cards llama-server sees, with VRAM in use")
+    devices = sub.add_parser("devices", help="the cards llama-server sees, with VRAM in use")
+    devices.add_argument("--backend", choices=BACKENDS, help="try a backend (default: the one picked on the page)")
     sub.add_parser("models", help="catalog and custom models, and which are downloaded")
     d = sub.add_parser("download", help="download one model by id")
     d.add_argument("model_id")
@@ -72,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     s = load_settings(args.env_file)
     if args.command == "devices":
-        return _devices(s)
+        return _devices(s, args.backend)
     if args.command == "models":
         return _models(s)
     if args.command == "download":

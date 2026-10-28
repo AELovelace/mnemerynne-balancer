@@ -11,6 +11,7 @@ DEVICE_LINE = re.compile(r"^\s*([A-Za-z]+\d+)\s*:\s*(.+?)\s*\((\d+)\s*MiB")  # "
 SYSFS = Path("/sys/class/drm")
 AMD_VENDOR = "0x1002"
 NVIDIA_QUERY = "pci.bus_id,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw"
+PREFIXES = {"rocm": "ROCm", "cuda": "CUDA"}  # llama-server's device names for each backend; auto takes any GPU.
 
 
 def child_env() -> dict:
@@ -19,8 +20,9 @@ def child_env() -> dict:
     return {**os.environ, "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
 
 
-def probe_devices(server: str, runner=subprocess.run) -> tuple[list[dict], str]:
-    """llama-server --list-devices: its GPUs (CPU entries skipped) and the raw output, which says why when there are none."""
+def probe_devices(server: str, runner=subprocess.run, backend: str = "auto") -> tuple[list[dict], str]:
+    """llama-server --list-devices: its GPUs (CPU entries skipped, and with a backend only that backend's) and the raw
+    output, which says why when there are none."""
     try:
         out = runner([server, "--list-devices"], capture_output=True, text=True, timeout=120, env=child_env())
     except (OSError, subprocess.SubprocessError) as error:
@@ -29,7 +31,7 @@ def probe_devices(server: str, runner=subprocess.run) -> tuple[list[dict], str]:
     devices = []
     for line in text.splitlines():
         m = DEVICE_LINE.match(line)
-        if m and not m.group(1).upper().startswith("CPU"):
+        if m and not m.group(1).upper().startswith("CPU") and m.group(1).startswith(PREFIXES.get(backend, "")):
             devices.append({"name": m.group(1), "description": m.group(2), "mib": int(m.group(3))})
     return devices, text.strip()
 
@@ -119,6 +121,11 @@ def nvidia_readings(runner=subprocess.run) -> list[dict]:
 def card_readings() -> list[dict]:
     """AMD cards from sysfs; if there are none (Windows, or an NVIDIA box), NVIDIA cards from nvidia-smi."""
     return gpu_readings() or nvidia_readings()
+
+
+def readings_for(backend: str) -> list[dict]:
+    """sysfs for rocm, nvidia-smi for cuda, card_readings for auto (which an AMD integrated GPU can fool)."""
+    return {"rocm": gpu_readings, "cuda": nvidia_readings}.get(backend, card_readings)()
 
 
 def match_readings(devices: list[dict], readings: list[dict]) -> list[dict | None]:

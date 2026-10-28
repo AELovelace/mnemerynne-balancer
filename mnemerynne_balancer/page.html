@@ -75,6 +75,16 @@ pre { background:var(--bar); padding:10px; border-radius:8px; overflow:auto; max
       <div id="hf-files" class="table-wrap"></div></div>
   </section>
   <section id="settings">
+    <h2>Backend</h2>
+    <div class="tile">
+      <p class="small muted">Which llama.cpp build runs the cards, and where their VRAM and temperature come from.
+      Auto uses LLAMA_SERVER and reads AMD cards first, so an NVIDIA box with an AMD integrated GPU needs CUDA picked here.
+      Applying restarts the running llama-servers with the same models.</p>
+      <div class="row"><select id="backend">
+        <option value="auto">Auto</option><option value="rocm">ROCm (AMD)</option><option value="cuda">CUDA (NVIDIA)</option>
+      </select><button class="act" id="save-backend">Apply</button></div>
+      <p class="small muted">llama-server: <code id="backend-path"></code></p>
+    </div>
     <h2>Secrets</h2>
     <div class="tile">
       <p class="small muted">Write-only: the page only shows whether each is set. Leave a field empty to keep it.</p>
@@ -392,6 +402,21 @@ $("save-secrets").onclick = async () => {
   try { await api("POST", "/api/settings", body); $("api-key").value = $("hf-token").value = ""; $("gen-out").textContent = ""; toast("Saved."); refresh(); }
   catch (e) { toast(e.message); }
 };
+let backendPicked = false;  // Until Apply, refreshes leave the dropdown where it was put.
+$("backend").onchange = () => { backendPicked = true; showBackend(); };
+function showBackend() {
+  if (!backendPicked) $("backend").value = status.backend;
+  $("backend-path").textContent = status.backends[$("backend").value];
+}
+$("save-backend").onclick = async () => {
+  const backend = $("backend").value;
+  if (backend === status.backend) return toast("That's the backend already.");
+  if (!confirm(`Switch to ${$("backend").selectedOptions[0].text}? Running llama-servers restart on ${status.backends[backend]}.`)) return;
+  $("save-backend").disabled = true;
+  try { await api("POST", "/api/settings", { backend }); backendPicked = false; toast("Switched backend."); refresh(); }
+  catch (e) { toast(e.message); }
+  finally { $("save-backend").disabled = false; }
+};
 $("gen-key").onclick = () => {
   const bytes = crypto.getRandomValues(new Uint8Array(24));
   const key = btoa(String.fromCharCode(...bytes)).replace(/[+/=]/g, "");
@@ -416,6 +441,7 @@ function render() {
   $("model-rows").replaceChildren(...status.models.map(modelRow));
   $("key-state").textContent = status.secrets.api_key ? "(set)" : "(not set: /v1 refuses everything)";
   $("hf-state").textContent = status.secrets.hf_token ? "(set)" : "(not set)";
+  showBackend();
   $("v1-url").textContent = `${location.protocol}//${location.host}/v1`;
   $("llama-path").textContent = status.llama_server; $("margin").textContent = status.vram_margin_mb; $("disk").textContent = status.disk_free_gb;
 }

@@ -16,12 +16,12 @@ import signal
 import subprocess
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import httpx
 
-from mnemerynne_balancer.config import Settings
+from mnemerynne_balancer.config import BACKENDS, Settings
 from mnemerynne_balancer.devices import child_env
 from mnemerynne_balancer.models import Models, chat_template_path, estimate_mib
 
@@ -162,15 +162,13 @@ class Fleet:
         self.popen = popen
         self.clock = clock
         self.http = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(3.0))
-        self.cards = []
-        for i, port in enumerate(settings.card_ports):
-            d = devices[i] if i < len(devices) else {"name": f"ROCm{i}", "description": "not detected", "mib": 0}
-            self.cards.append(Card(i, d["name"], d["description"], d["mib"], port))
+        self.backend = settings.backend  # create_app passes the saved one (saved_backend), with its llama-server.
+        self.cards = [Card(i, "", "", 0, port) for i, port in enumerate(settings.card_ports)]
         self.locks = [asyncio.Lock() for _ in self.cards]
         # The BFGguf: one llama-server on every card, on the first card's port. It's a Card so the watchdog, the proxy
         # and the page treat it like the others; its config is kept apart, so the cards' own come back on switching.
-        self.bfgguf = Card(0, ",".join(c.device for c in self.cards), "every card, layers split evenly",
-                           sum(c.vram_mib for c in self.cards), self.cards[0].port)
+        self.bfgguf = Card(0, "", "every card, layers split evenly", 0, self.cards[0].port)
+        self._set_devices(devices)
         default = next((m for m in models.all() if m.get("bfgguf")), None)
         if default:
             self.bfgguf.config = CardConfig(default["id"], int(default["ctx"]), int(default["slots"]))
@@ -181,6 +179,16 @@ class Fleet:
         # Set when shutdown begins (SIGTERM): systemd stops the llama-servers at the same moment, so their exits
         # are not crashes, and nothing may start while connections drain.
         self.closing = False
+
+    def _set_devices(self, devices: list[dict]) -> None:
+        """Each card gets llama-server's device in order (ROCm0, CUDA1, ...); the BFGguf gets all of them."""
+        prefix = "CUDA" if self.backend == "cuda" else "ROCm"
+        for card in self.cards:
+            d = devices[card.index] if card.index < len(devices) else \
+                {"name": f"{prefix}{card.index}", "description": "not detected", "mib": 0}
+            card.device, card.description, card.vram_mib = d["name"], d["description"], d["mib"]
+        self.bfgguf.device = ",".join(c.device for c in self.cards)
+        self.bfgguf.vram_mib = sum(c.vram_mib for c in self.cards)
 
     # ------------------------------------------------------------ state file
     def load_state(self) -> None:
@@ -206,7 +214,8 @@ class Fleet:
         path = self.settings.state_file
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        state = {"role": self.role, "cards": [asdict(c.config) for c in self.cards], "bfgguf": asdict(self.bfgguf.config)}
+        state = {"role": self.role, "backend": self.backend, "cards": [asdict(c.config) for c in self.cards],
+                 "bfgguf": asdict(self.bfgguf.config)}
         tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
         tmp.replace(path)
 
@@ -452,26 +461,54 @@ class Fleet:
                 return fit
             self.switching = True
             try:
-                old = self.active()
-                for card in old:
-                    card.state = "stopping"
-                await asyncio.gather(*(self._kill(c) for c in old))  # Every old process has exited: VRAM is free.
-                for card in old:
-                    card.state, card.error, card.started_at, card.next_start = "stopped", "", None, None
-                    card.tokens_per_s = None
+                await self._halt()
                 self.role = role
                 if role == "bfgguf":
                     self.bfgguf.config.running = True
                 self.save_state()
                 LOG.info("Switched to the %s role", role)
-                for card in self.active():
-                    if card.config.running:
-                        card.failures.clear()
-                        card.backoff = BACKOFF_START
-                        self._spawn(card)
+                self._resume()
             finally:
                 self.switching = False
         return fit
+
+    async def set_backend(self, backend: str, server: str, devices: list[dict]) -> None:
+        """Stop the running set, take the backend's llama-server and its devices (the caller probed `devices` with
+        `server`), and start the same set again on them."""
+        if backend not in BACKENDS:
+            raise ValueError('The backend must be "auto", "rocm" or "cuda".')
+        async with self._all_locks():
+            if self.closing:
+                raise ValueError("The balancer is shutting down.")
+            self.switching = True
+            try:
+                await self._halt()
+                self.backend = backend
+                self.settings = replace(self.settings, backend=backend, llama_server=server)
+                self._set_devices(devices)
+                self.save_state()
+                LOG.info("Switched to the %s backend: %s", backend, server)
+                self._resume()
+            finally:
+                self.switching = False
+
+    async def _halt(self) -> None:
+        """Stop the active set and wait until every one of its processes has exited (so its VRAM is free).
+        Their configs keep running=True, so _resume brings back whichever set is active then."""
+        old = self.active()
+        for card in old:
+            card.state = "stopping"
+        await asyncio.gather(*(self._kill(c) for c in old))
+        for card in old:
+            card.state, card.error, card.started_at, card.next_start = "stopped", "", None, None
+            card.tokens_per_s = None
+
+    def _resume(self) -> None:
+        for card in self.active():
+            if card.config.running:
+                card.failures.clear()
+                card.backoff = BACKOFF_START
+                self._spawn(card)
 
     async def stop_all(self) -> None:
         """Shutdown: stop every llama-server, all at once so two slow cards still fit in systemd's TimeoutStopSec.
@@ -568,6 +605,15 @@ class Fleet:
 
     def bfgguf_view(self) -> dict:
         return {**self.bfgguf.view(), "index": None, "cards": self.card_indices(self.bfgguf)}
+
+
+def saved_backend(settings: Settings) -> str:
+    """The backend picked on the page (state.json), or BALANCER_BACKEND until one has been."""
+    try:
+        saved = json.loads(settings.state_file.read_text(encoding="utf-8")).get("backend")
+    except (OSError, ValueError, AttributeError):
+        saved = None
+    return saved if saved in BACKENDS else settings.backend
 
 
 def _config(saved) -> CardConfig | None:

@@ -28,7 +28,8 @@ git clone https://github.com/AELovelace/mnemerynne-balancer.git /opt/mnemerynne-
 ```
 
 `build-llama.sh` builds llama-server from the same llama.cpp tag as
-npc-rag's script. It looks at the cards to pick the backend:
+npc-rag's script. It picks the backend from the cards, NVIDIA first (an
+NVIDIA box can also have an AMD integrated GPU):
 
 - **AMD:** ROCm HIP into `/opt/llama.cpp/hip`, with ROCm from the distro's
   own packages. Set `GPU_TARGETS` if your cards aren't gfx1030
@@ -41,7 +42,8 @@ npc-rag's script. It looks at the cards to pick the backend:
 
 `BACKEND=hip` or `BACKEND=cuda` overrides the choice. `install.sh` uses the
 HIP build, or the CUDA one when there's no HIP build, and writes it to
-`LLAMA_SERVER` in `.env`.
+`LLAMA_SERVER` in `.env`. If the balancer ends up on the wrong one, pick it
+in the Settings tab's **Backend** dropdown (below).
 
 `install.sh` does the following, and is safe to run again (an existing
 `.env` keeps its values):
@@ -142,6 +144,15 @@ Open `http://<node>:9180/` and sign in with the password.
   same role (see BFGguf below).
 - **Settings tab.** Replace the API key (there's a **Generate** button) or
   set a Hugging Face token for gated repos. Both are write-only.
+  - **Backend:** Auto, ROCm (AMD) or CUDA (NVIDIA). It picks the
+    llama-server (`/opt/llama.cpp/hip` or `/opt/llama.cpp/cuda`, or
+    `LLAMA_SERVER_ROCM`/`_CUDA`), where VRAM and temperature come from
+    (sysfs or `nvidia-smi`), and which devices count as cards. Auto uses
+    `LLAMA_SERVER` and reads AMD cards first, which an AMD integrated GPU
+    fools on an NVIDIA box. **Apply** checks that the build lists that
+    backend's devices (or says why not and changes nothing), then restarts
+    the running llama-servers on it with the same models. The choice
+    survives restarts; `devices --backend cuda` tries one from the shell.
 - **Activity tab.** Who signed in, started, stopped, downloaded or changed
   what, and from where. Secret values are never written.
 
@@ -241,6 +252,8 @@ curl http://<node>:9180/v1/chat/completions \
 | `CARD_PORTS` | `9181,9182` | one local port per card, in ROCm order |
 | `VRAM_MARGIN_MB` | `512` | kept free on top of the estimate (per card) |
 | `BALANCER_ROLE` | `balancer` | `balancer` or `bfgguf`; only for a node with no saved state yet |
+| `BALANCER_BACKEND` | `auto` | `auto`, `rocm` or `cuda`; only until the Settings tab saves one |
+| `LLAMA_SERVER_ROCM`, `LLAMA_SERVER_CUDA` | empty | each backend's llama-server; empty: build-llama.sh's build if it's there, else `LLAMA_SERVER` |
 | `BALANCER_DATA_DIR` | `/var/lib/mnemerynne-balancer` | models, logs, state, audit log |
 
 After changing `.env`: `sudo systemctl restart mnemerynne-balancer`. That
