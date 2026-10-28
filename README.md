@@ -138,9 +138,13 @@ sudo CUDA_VERSION=12.8 ALLOW_FROM=172.27.0.0/16 /opt/mnemerynne-balancer/linux/i
   for Maxwell); `skip` leaves the driver alone. After a fresh driver install
   akmods still builds the module: `akmods --force && reboot`, then run the
   script again.
-- `HOST_GCC` (default `14`) is the compat gcc nvcc builds with. If Fedora
-  has no such package the build goes ahead with
-  `-allow-unsupported-compiler`.
+- `HOST_GCC` (default `14`) is the compat gcc nvcc builds with. nvcc 12
+  stops at gcc 14, and Fedora 44 ships gcc 16 with no gcc14 package, so
+  there the script switches to `build-llama-container.sh`: it builds in
+  NVIDIA's own `nvidia/cuda:12.8-devel` image (whose gcc fits its nvcc)
+  with cudart, cublas and libstdc++ linked statically, and the binary runs
+  on the host with only the driver. Needs podman (installed if missing); no
+  toolkit on the host. `BUILD=host` or `BUILD=container` forces either.
 - Re-running is safe: repos, driver and toolkit are left alone once there.
 - Flash attention works on CUDA, so a model added here doesn't need the
   `-fa off` the RX 6800 entries carry.
