@@ -46,15 +46,21 @@ echo "== building llama-server $LLAMA_TAG with CUDA $CUDA_VERSION (sm $CUDA_ARCH
 "$ENGINE" run --rm -v "$SRC:/src:Z" -v "$OUT:/out:Z" -e CUDA_ARCHS="$CUDA_ARCHS" "$IMAGE" bash -euo pipefail -c '
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq && apt-get install -y -qq git cmake ninja-build build-essential >/dev/null
+  # The image ships NCCL (multi-node collectives) and llama.cpp links it dynamically when it finds it; the host has
+  # no libnccl.so.2 and the balancer never needs it, so it goes before cmake looks.
+  apt-get remove -y -qq "libnccl*" >/dev/null 2>&1 || true
+  rm -rf /usr/local/cuda/lib64/libnccl* /usr/local/cuda/include/nccl*.h /usr/lib/x86_64-linux-gnu/libnccl*
   git config --global --add safe.directory "*"
+  rm -rf /src/build-cuda-container
   cmake -S /src -B /src/build-cuda-container -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_SHARED_LIBS=OFF -DGGML_STATIC=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
-    -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
+    -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" -DCMAKE_DISABLE_FIND_PACKAGE_NCCL=ON \
     -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
   cmake --build /src/build-cuda-container --target llama-server -j "$(nproc)"
   install -m 755 /src/build-cuda-container/bin/llama-server /out/bin/llama-server
 '
 echo "== cuda: $("$OUT/bin/llama-server" --version 2>&1 | head -1)"
-echo "   links: $(ldd "$OUT/bin/llama-server" | grep -oE 'lib(cuda|cudart|cublas|stdc\+\+)[^ ]*' | sort -u | tr '\n' ' ')"
+# Everything beyond glibc, libgomp and the driver's libcuda is a library the host must have: say so here, not at start.
+echo "   links: $(ldd "$OUT/bin/llama-server" | grep -vE 'linux-vdso|ld-linux|libc\.so|libm\.so|libpthread|libdl|librt|libgomp|libgcc_s' | awk '{print $1 ($3=="not" ? " (MISSING)" : "")}' | tr '\n' ' ')"
 "$OUT/bin/llama-server" --list-devices 2>&1 | sed 's/^/   /'
 echo "Done. Next: sudo $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install.sh"
